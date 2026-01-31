@@ -1,10 +1,78 @@
-[package]
-name = "shodan"
-version = "0.1.0"
-authors = ["Femi Agbabiaka <femi@femiagbabiaka.xyz>"]
-license = "GPL-3.0"
-description = "A Rusty wrapper for the Shodan.io API."
+[workspace]
+resolver = "2"
+members = [
+    "crates/shodan-core",
+    "crates/shodan-client",
+    "crates/shodan-recon",
+    "crates/shodan",
+    "crates/shodan-cli",
+]
 
-[dependencies]
-hyper = "0.10.0"
-hyper-native-tls = "0.2.1"
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/femiagbabiaka/shodan-rust"
+keywords = ["shodan", "security", "networking", "reconnaissance", "osint"]
+categories = ["network-programming", "api-bindings"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+
+# Logging/Tracing
+tracing = "0.1"
+
+# Async utilities
+async-trait = "0.1"
+futures-util = "0.3"
+tokio-stream = "0.1"
+
+# Rate limiting
+governor = "0.8"
+
+# Network tools (optional features)
+# pistol = "4.0"  # Disabled - has broken dependencies
+whois-rs = "1.6"
+hickory-resolver = "0.25"
+trippy-core = "0.11"
+
+# URL handling
+url = "2.5"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Internal crates
+shodan-core = { path = "crates/shodan-core" }
+shodan-client = { path = "crates/shodan-client" }
+shodan-recon = { path = "crates/shodan-recon" }
+
+# Testing
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allow common patterns
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

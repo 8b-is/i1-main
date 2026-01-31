@@ -1,0 +1,33 @@
+[package]
+name = "shodan-client"
+description = "HTTP client for the Shodan API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["rustls"]
+rustls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+shodan-core = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+governor = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

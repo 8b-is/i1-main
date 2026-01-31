@@ -1,0 +1,190 @@
+╔══════════════════════════════════════════════════════════════╗
+║         GEO-BLOCKING TOOLKIT FOR MAIL SERVERS                ║
+║                                                              ║
+║  Complete solution for blocking countries at firewall level ║
+╚══════════════════════════════════════════════════════════════╝
+
+📦 PACKAGE CONTENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. geoblock-setup.sh
+   → Main installation script
+   → Automated setup with one command
+   → Configure countries, whitelists, and attackers
+   → Makes everything persistent
+
+2. GEOBLOCK-README.md  
+   → Complete documentation
+   → Configuration guide
+   → Troubleshooting tips
+   → Management commands
+
+3. geoblock-quick-status.sh
+   → Quick status checker
+   → Shows what's blocked
+   → Verify configuration
+
+4. test-geoblock.sh
+   → Test if an IP would be blocked
+   → Useful before adding countries
+
+5. geoblock-manage (installed after setup)
+   → System-wide management tool
+   → Available at: /usr/local/bin/geoblock-manage
+   → Easy enable/disable/status commands
+
+
+🚀 QUICK START
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For a new mail server:
+
+1. Copy the files to your server:
+   scp geoblock-* root@your-mailserver:/root/
+
+2. Edit the configuration:
+   nano geoblock-setup.sh
+   
+   Set:
+   - BLOCKED_COUNTRIES (which countries to block)
+   - WHITELIST_IP (your IP address)
+   - ADDITIONAL_WHITELIST (other safe IPs)
+   - ATTACKER_IPS (known attackers)
+
+3. Run the setup:
+   ./geoblock-setup.sh
+
+4. Verify it worked:
+   ./geoblock-quick-status.sh
+
+
+📋 COMMON CONFIGURATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Block the "usual suspects":
+  BLOCKED_COUNTRIES=("cn" "ru" "ro" "pl" "kz" "ua" "vn")
+
+Block common spam sources:
+  BLOCKED_COUNTRIES=("cn" "ru" "br" "in" "vn" "kr")
+
+Very restrictive (allow only US/EU):
+  # Use a whitelist approach instead - contact me for that script
+
+
+🔧 AFTER INSTALLATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Management commands available:
+
+  geoblock-manage status        # Show current status
+  geoblock-manage disable       # Temporarily disable
+  geoblock-manage enable        # Re-enable  
+  geoblock-manage add-ip IP     # Whitelist an IP
+  geoblock-manage block-ip IP   # Block specific IP
+
+Check what's happening:
+
+  ./geoblock-quick-status.sh    # Quick overview
+  nft list ruleset              # See all rules
+  journalctl -u nftables-geoblock  # Service logs
+
+
+⚠️  IMPORTANT NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ALWAYS set your IP in WHITELIST_IP before running
+2. Test after setup to ensure you can still access the server
+3. Keep console/KVM access available as backup
+4. Rules persist across reboots automatically
+5. Update IP ranges monthly for best protection
+
+
+🌍 COUNTRY CODES REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Common malicious sources:
+  cn - China          ru - Russia        ro - Romania
+  pl - Poland         kz - Kazakhstan    ua - Ukraine
+  vn - Vietnam        in - India         br - Brazil
+  kr - South Korea    th - Thailand      id - Indonesia
+
+Full list: https://www.ipdeny.com/ipblocks/
+
+
+💡 TIPS & TRICKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• The script is idempotent - safe to run multiple times
+• To add countries later, just edit and re-run the script
+• Blocking happens at kernel level (very efficient)
+• Works alongside mailcow's fail2ban (defense in depth)
+• Does NOT interfere with Docker, mailcow, or Let's Encrypt
+
+
+📞 EMERGENCY ACCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If you get locked out, use console access:
+
+  nft delete table inet geoblock
+
+This immediately removes all geo-blocking.
+
+
+📁 FILES CREATED BY SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /etc/nftables/geoblock.nft
+    → nftables configuration (all rules)
+
+  /etc/systemd/system/nftables-geoblock.service
+    → Systemd service (auto-start on boot)
+
+  /usr/local/bin/geoblock-manage
+    → Management tool (system-wide command)
+
+
+🔒 WHAT GETS BLOCKED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ All HTTP/HTTPS traffic from blocked countries
+✓ SMTP/IMAP/POP3/Submission attempts  
+✓ SSH brute force attacks
+✓ Port scans and probes
+✓ ANY network connection from blocked IPs
+
+✗ Does NOT block VPNs/proxies (they use different IPs)
+✗ Does NOT block Tor (needs separate configuration)
+
+
+📊 CURRENT INSTALLATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This server currently has geo-blocking active:
+  → Blocking: Romania, Russia, Poland, Kazakhstan
+  → Total: 15,414 networks blocked
+  → Your IP: 173.71.155.73 (whitelisted)
+  → Status: Active and persistent
+
+
+🎓 LEARNING RESOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• nftables wiki: https://wiki.nftables.org/
+• IP blocks source: https://www.ipdeny.com/
+• Mailcow docs: https://docs.mailcow.email/
+• This package README: cat GEOBLOCK-README.md
+
+
+✅ READY TO DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Everything is ready to use on another server!
+
+Just copy these files:
+  • geoblock-setup.sh
+  • GEOBLOCK-README.md  
+  • geoblock-quick-status.sh
+  • test-geoblock.sh
+
+Configure, run, and you're protected! 🛡️

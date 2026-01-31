@@ -1,0 +1,42 @@
+[package]
+name = "shodan-recon"
+description = "Network reconnaissance tools integration for Shodan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+scanner = []
+whois = ["whois-rs"]
+# dns and trace disabled temporarily due to API changes
+# dns = ["hickory-resolver"]
+# trace = ["trippy-core"]
+full = ["scanner", "whois"]
+
+[dependencies]
+shodan-core = { workspace = true }
+shodan-client = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+
+# Port scanning (basic TCP connect - no raw sockets required)
+# pistol has broken dependencies, so we use our own implementation
+
+# Optional: WHOIS
+whois-rs = { workspace = true, optional = true }
+
+# Optional: DNS (temporarily disabled - API changes)
+# hickory-resolver = { workspace = true, optional = true }
+
+# Optional: Traceroute (temporarily disabled - API changes)
+# trippy-core = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "shodan"
+description = "Modern Rust client for the Shodan.io API with integrated network reconnaissance tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[features]
+default = ["rustls"]
+
+# TLS backends (pick one)
+rustls = ["shodan-client/rustls"]
+native-tls = ["shodan-client/native-tls"]
+
+# Network reconnaissance tools
+recon = ["shodan-recon"]
+scanner = ["recon", "shodan-recon/scanner"]
+whois = ["recon", "shodan-recon/whois"]
+# dns and trace temporarily disabled due to API changes
+# dns = ["recon", "shodan-recon/dns"]
+# trace = ["recon", "shodan-recon/trace"]
+full-recon = ["scanner", "whois"]
+
+[dependencies]
+shodan-core = { workspace = true }
+shodan-client = { workspace = true }
+shodan-recon = { workspace = true, optional = true }
+
+# Re-export key runtime
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true
