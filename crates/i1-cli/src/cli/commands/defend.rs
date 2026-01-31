@@ -113,7 +113,7 @@ async fn status(ctx: Context, quick: bool) -> Result<()> {
     Ok(())
 }
 
-async fn geoblock(ctx: Context, args: GeoblockArgs) -> Result<()> {
+async fn geoblock(_ctx: Context, args: GeoblockArgs) -> Result<()> {
     match args.command {
         GeoblockCommands::List => {
             let state = defend::State::load()?;

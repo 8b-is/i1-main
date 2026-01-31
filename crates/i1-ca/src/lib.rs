@@ -88,8 +88,10 @@ pub enum CertificateType {
 
 /// Key algorithm choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum KeyAlgorithm {
     /// ECDSA with P-256 curve (recommended for speed)
+    #[default]
     EcdsaP256,
     /// ECDSA with P-384 curve (higher security)
     EcdsaP384,
@@ -99,11 +101,6 @@ pub enum KeyAlgorithm {
     Rsa4096,
 }
 
-impl Default for KeyAlgorithm {
-    fn default() -> Self {
-        Self::EcdsaP256
-    }
-}
 
 /// Validity period presets.
 #[derive(Debug, Clone, Copy)]

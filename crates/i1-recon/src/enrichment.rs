@@ -52,7 +52,7 @@ impl HostEnricher {
     }
 
     /// Enrich a single IP address with all configured local sources
-    pub async fn enrich(&self, ip: IpAddr) -> EnrichedHost {
+    pub async fn enrich(&self, _ip: IpAddr) -> EnrichedHost {
         let result = EnrichedHost::default();
 
         // Run port scan if configured

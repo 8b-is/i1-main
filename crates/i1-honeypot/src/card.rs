@@ -123,7 +123,7 @@ fn calculate_luhn_check_digit(digits: &[u8]) -> u8 {
         double = !double;
     }
 
-    ((10 - (sum % 10)) % 10) as u8
+    (10 - (sum % 10)) % 10
 }
 
 /// Validate a card number using LUHN algorithm.

@@ -7,7 +7,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{CaError, CertificateInfo, CertificateType};
+use crate::{CertificateInfo, CertificateType};
 
 /// A signed end-entity certificate with its key.
 #[derive(Debug, Clone)]
@@ -78,6 +78,7 @@ impl CertificateRequest {
 
 impl EndEntityCert {
     /// Create cert info for tracking.
+    #[allow(dead_code)] // Future use when IntermediateCa returns EndEntityCert
     pub(crate) fn create_info(
         domains: &[String],
         issuer: &str,

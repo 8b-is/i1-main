@@ -11,7 +11,7 @@ use rcgen::{
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::{CaError, CertificateInfo, CertificateType, IntermediatePurpose, KeyAlgorithm, ValidityPeriod};
+use crate::{CaError, CertificateInfo, CertificateType, IntermediatePurpose, KeyAlgorithm};
 
 /// Intermediate Certificate Authority.
 ///

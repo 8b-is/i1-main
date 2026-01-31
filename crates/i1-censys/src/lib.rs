@@ -386,6 +386,7 @@ struct CensysHost {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // API response fields - may not all be used yet
 struct CensysService {
     port: u16,
     #[serde(default)]
