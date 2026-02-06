@@ -239,6 +239,63 @@ pub enum DefendCommands {
 
     /// Community threat intelligence sharing
     Community(CommunityArgs),
+
+    /// Auto-patrol logs and ban attackers
+    Patrol(PatrolArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PatrolArgs {
+    #[command(subcommand)]
+    pub command: PatrolCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PatrolCommands {
+    /// Scan logs now and ban detected attackers
+    Run {
+        /// Minimum 404 hits to trigger a ban (default: 5)
+        #[arg(long, default_value = "5")]
+        threshold: u32,
+
+        /// Time window in minutes to look back (default: 60)
+        #[arg(long, short, default_value = "60")]
+        window: u32,
+
+        /// Show what would be banned without applying
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Path to docker compose project (default: /opt/mailcow-dockerized)
+        #[arg(long)]
+        compose_dir: Option<String>,
+
+        /// Apply iptables rules immediately
+        #[arg(long, short)]
+        execute: bool,
+    },
+
+    /// Install a cron job for automated patrol
+    Cron {
+        /// Run every N minutes (default: 15)
+        #[arg(long, default_value = "15")]
+        interval: u32,
+
+        /// Remove the cron job
+        #[arg(long)]
+        remove: bool,
+
+        /// Minimum 404 hits to trigger a ban (default: 5)
+        #[arg(long, default_value = "5")]
+        threshold: u32,
+    },
+
+    /// Show patrol activity log
+    Log {
+        /// Number of recent entries to show
+        #[arg(long, short, default_value = "20")]
+        lines: u32,
+    },
 }
 
 #[derive(Args, Debug)]

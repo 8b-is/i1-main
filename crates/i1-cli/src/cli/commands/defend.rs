@@ -6,7 +6,7 @@ use colored::Colorize;
 use super::Context;
 use crate::cli::args::{
     CommunityArgs, CommunityCommands, DefendArgs, DefendCommands, GeoblockArgs, GeoblockCommands,
-    PullArgs, PushArgs, WhitelistArgs, WhitelistCommands,
+    PatrolArgs, PatrolCommands, PullArgs, PushArgs, WhitelistArgs, WhitelistCommands,
 };
 use crate::defend;
 use crate::output::OutputFormat;
@@ -29,6 +29,7 @@ pub async fn execute(ctx: Context, args: DefendArgs) -> Result<()> {
         DefendCommands::Push(args) => push(ctx, args).await,
         DefendCommands::Pull(args) => pull(ctx, args).await,
         DefendCommands::Community(args) => community(ctx, args).await,
+        DefendCommands::Patrol(args) => patrol(ctx, args).await,
     }
 }
 
@@ -1324,6 +1325,602 @@ async fn community_stats() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn patrol(_ctx: Context, args: PatrolArgs) -> Result<()> {
+    match args.command {
+        PatrolCommands::Run {
+            threshold,
+            window,
+            dry_run,
+            compose_dir,
+            execute,
+        } => patrol_run(threshold, window, dry_run, compose_dir, execute).await,
+        PatrolCommands::Cron {
+            interval,
+            remove,
+            threshold,
+        } => patrol_cron(interval, remove, threshold).await,
+        PatrolCommands::Log { lines } => patrol_log(lines).await,
+    }
+}
+
+/// Suspicious patterns that indicate an attacker
+const ATTACK_PATTERNS: &[&str] = &[
+    // Webshell scanning
+    ".php",
+    // WordPress exploits
+    "wp-content",
+    "wp-admin",
+    "wp-login",
+    "wp-includes",
+    "xmlrpc.php",
+    // Common exploit paths
+    ".env",
+    "/.git/",
+    "/config",
+    "/admin",
+    "/phpmyadmin",
+    "/phpMyAdmin",
+    "/pma",
+    "/myadmin",
+    // Shell/backdoor attempts
+    "/shell",
+    "/cmd",
+    "/eval",
+    "/exec",
+    "cgi-bin",
+    // Scanner fingerprints
+    "/actuator",
+    "/api/v1",
+    "/.well-known/security.txt",
+    "/solr/",
+    "/console",
+    "/manager/html",
+    // Path traversal
+    "../",
+    "..%2f",
+    "%00",
+];
+
+/// IPs/ranges to never ban (health checks, internal, etc.)
+const PATROL_NEVER_BAN: &[&str] = &[
+    "127.0.0.1",
+    "172.22.",   // Docker internal IPv4
+    "10.",
+    "192.168.",
+    "fd4d:",     // Docker internal IPv6 (ULA)
+    "fc",        // IPv6 ULA prefix
+    "fd",        // IPv6 ULA prefix
+    "fe80:",     // Link-local
+    "::1",       // IPv6 loopback
+];
+
+struct PatrolHit {
+    ip: String,
+    total_requests: u32,
+    attack_hits: u32,
+    four04_hits: u32,
+    sample_paths: Vec<String>,
+}
+
+async fn patrol_run(
+    threshold: u32,
+    window: u32,
+    dry_run: bool,
+    compose_dir: Option<String>,
+    execute: bool,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    let compose_path = compose_dir.unwrap_or_else(|| "/opt/mailcow-dockerized".to_string());
+
+    println!("{}", "━".repeat(60).dimmed());
+    println!("{}", "🔍 PATROL - Scanning for attackers".cyan().bold());
+    println!("{}", "━".repeat(60).dimmed());
+    println!(
+        "  Window: {} min | Threshold: {} hits | {}",
+        window,
+        threshold,
+        if dry_run {
+            "DRY RUN".yellow().to_string()
+        } else {
+            "LIVE".green().to_string()
+        }
+    );
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    // Load current state to know what's already banned
+    let state = defend::State::load()?;
+    let already_banned: std::collections::HashSet<&str> =
+        state.blocked_ips.iter().map(|s| s.as_str()).collect();
+    let whitelisted: std::collections::HashSet<&str> =
+        state.whitelisted_ips.iter().map(|s| s.as_str()).collect();
+
+    // Get nginx logs from docker compose
+    print!("{} Fetching nginx logs... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let since_arg = format!("{}m", window);
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{}/docker-compose.yml", compose_path),
+            "logs",
+            "--no-color",
+            "--since",
+            &since_arg,
+            "nginx-mailcow",
+        ])
+        .output();
+
+    let nginx_logs = match output {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            println!("{}", "✓".green());
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+        _ => {
+            // Fallback: try docker logs directly
+            let fallback = Command::new("docker")
+                .args(["logs", "--since", &since_arg, "maatmail-nginx-mailcow-1"])
+                .output();
+            match fallback {
+                Ok(out) if !out.stdout.is_empty() => {
+                    println!("{} (via docker logs)", "✓".green());
+                    String::from_utf8_lossy(&out.stdout).to_string()
+                }
+                _ => {
+                    println!("{}", "✗".red());
+                    anyhow::bail!(
+                        "Could not fetch nginx logs. Is mailcow running at {}?",
+                        compose_path
+                    );
+                }
+            }
+        }
+    };
+
+    // Also get postfix logs for SMTP abuse
+    let postfix_output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{}/docker-compose.yml", compose_path),
+            "logs",
+            "--no-color",
+            "--since",
+            &since_arg,
+            "postfix-mailcow",
+        ])
+        .output()
+        .ok();
+
+    // Parse nginx logs - extract IP, status code, path
+    let mut ip_stats: HashMap<String, PatrolHit> = HashMap::new();
+
+    for line in nginx_logs.lines() {
+        // nginx log format: "IP - user [date] "METHOD /path HTTP/x.x" STATUS ..."
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            continue;
+        }
+
+        // Find the IP (first thing that looks like an IP in the line)
+        let ip = match parts.iter().find(|p| {
+            p.contains('.') && p.split('.').count() == 4 && p.parse::<std::net::Ipv4Addr>().is_ok()
+                || p.contains(':') && p.parse::<std::net::Ipv6Addr>().is_ok()
+        }) {
+            Some(ip) => ip.to_string(),
+            None => continue,
+        };
+
+        // Skip internal/never-ban IPs
+        if PATROL_NEVER_BAN.iter().any(|prefix| ip.starts_with(prefix)) {
+            continue;
+        }
+
+        // Find the path (usually after "GET or "POST etc)
+        let path = parts
+            .iter()
+            .find(|p| p.starts_with('/'))
+            .unwrap_or(&"/")
+            .to_string();
+
+        // Find the HTTP status code (3 digit number after HTTP/x.x")
+        let status: u16 = parts
+            .iter()
+            .filter_map(|p| {
+                if p.len() == 3 {
+                    p.parse::<u16>().ok()
+                } else {
+                    None
+                }
+            })
+            .find(|&s| (100..600).contains(&s))
+            .unwrap_or(0);
+
+        let is_attack = ATTACK_PATTERNS.iter().any(|pat| path.contains(pat));
+        let is_404 = status == 404;
+
+        let hit = ip_stats.entry(ip.clone()).or_insert_with(|| PatrolHit {
+            ip: ip.clone(),
+            total_requests: 0,
+            attack_hits: 0,
+            four04_hits: 0,
+            sample_paths: Vec::new(),
+        });
+
+        hit.total_requests += 1;
+        if is_attack {
+            hit.attack_hits += 1;
+        }
+        if is_404 {
+            hit.four04_hits += 1;
+        }
+        if (is_attack || is_404) && hit.sample_paths.len() < 5 {
+            hit.sample_paths.push(path);
+        }
+    }
+
+    // Parse postfix logs for SMTP abuse
+    if let Some(Ok(pf_out)) = postfix_output.map(|o| {
+        if o.stdout.is_empty() {
+            Err(())
+        } else {
+            Ok(String::from_utf8_lossy(&o.stdout).to_string())
+        }
+    }) {
+        for line in pf_out.lines() {
+            // Look for rejected connections, auth failures
+            if line.contains("NOQUEUE: reject")
+                || line.contains("authentication failed")
+                || line.contains("too many errors")
+            {
+                // Extract IP from postfix log
+                if let Some(start) = line.find('[') {
+                    if let Some(end) = line[start..].find(']') {
+                        let ip = &line[start + 1..start + end];
+                        if is_valid_ip(ip)
+                            && !PATROL_NEVER_BAN.iter().any(|prefix| ip.starts_with(prefix))
+                        {
+                            let hit =
+                                ip_stats.entry(ip.to_string()).or_insert_with(|| PatrolHit {
+                                    ip: ip.to_string(),
+                                    total_requests: 0,
+                                    attack_hits: 0,
+                                    four04_hits: 0,
+                                    sample_paths: Vec::new(),
+                                });
+                            hit.attack_hits += 1;
+                            hit.total_requests += 1;
+                            if hit.sample_paths.len() < 5 {
+                                hit.sample_paths.push("SMTP abuse".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Get our own IP to never ban ourselves
+    let my_ip = get_my_public_ip().await.ok();
+    let ssh_ip = get_ssh_client_ip();
+
+    // Filter to attackers that exceed threshold
+    // Key insight: require BOTH suspicious paths AND 404s for web scanning,
+    // or high attack_hits for SMTP abuse (which doesn't produce 404s)
+    let mut attackers: Vec<PatrolHit> = ip_stats
+        .into_values()
+        .filter(|h| {
+            // Must have attack-pattern 404s (webshell scanning) or pure SMTP abuse
+            let has_web_scanning = h.four04_hits >= threshold;
+            let has_smtp_abuse = h.sample_paths.iter().any(|p| p == "SMTP abuse")
+                && h.attack_hits >= threshold;
+            has_web_scanning || has_smtp_abuse
+        })
+        .collect();
+
+    attackers.sort_by(|a, b| b.four04_hits.cmp(&a.four04_hits));
+
+    // Separate new vs already-banned, skip our own IP and whitelisted
+    let (new_attackers, known_attackers): (Vec<_>, Vec<_>) = attackers
+        .into_iter()
+        .filter(|h| {
+            // Never ban our own IP
+            if let Some(ref ip) = my_ip {
+                if h.ip == *ip {
+                    return false;
+                }
+            }
+            if let Some(ref ip) = ssh_ip {
+                if h.ip == *ip {
+                    return false;
+                }
+            }
+            true
+        })
+        .partition(|h| !already_banned.contains(h.ip.as_str()) && !whitelisted.contains(h.ip.as_str()));
+
+    println!(
+        "{} Scanned {} log lines",
+        "✓".green(),
+        nginx_logs.lines().count()
+    );
+    println!();
+
+    if !known_attackers.is_empty() {
+        println!(
+            "{} {} already-banned IPs seen (still probing)",
+            "•".dimmed(),
+            known_attackers.len()
+        );
+    }
+
+    if new_attackers.is_empty() {
+        println!("{}", "All clear! No new attackers detected.".green().bold());
+        patrol_log_entry("patrol: clean - no new attackers")?;
+        return Ok(());
+    }
+
+    println!(
+        "{} {} new attacker(s) detected!",
+        "⚠".yellow(),
+        new_attackers.len()
+    );
+    println!();
+
+    // Display attackers
+    for attacker in &new_attackers {
+        println!(
+            "  {} {} - {} attack hits, {} 404s / {} total",
+            "✗".red(),
+            attacker.ip.red().bold(),
+            attacker.attack_hits,
+            attacker.four04_hits,
+            attacker.total_requests
+        );
+        for path in &attacker.sample_paths {
+            println!("    {}", path.dimmed());
+        }
+    }
+    println!();
+
+    if dry_run {
+        println!("{}", "[DRY RUN] Would ban the above IPs.".yellow());
+        return Ok(());
+    }
+
+    // Ban them
+    let mut state = defend::State::load()?;
+    let mut banned_count = 0;
+
+    for attacker in &new_attackers {
+        if !state.blocked_ips.contains(&attacker.ip) {
+            state.blocked_ips.push(attacker.ip.clone());
+            banned_count += 1;
+
+            if execute {
+                // Determine if IPv4 or IPv6
+                let cmd = if attacker.ip.contains(':') {
+                    "ip6tables"
+                } else {
+                    "iptables"
+                };
+                let _ = std::process::Command::new("sudo")
+                    .args([cmd, "-I", "INPUT", "-s", &attacker.ip, "-j", "DROP"])
+                    .output();
+            }
+        }
+    }
+
+    state.save()?;
+
+    println!(
+        "{} Banned {} new attacker(s){}",
+        "✓".green(),
+        banned_count,
+        if execute {
+            " + applied iptables rules"
+        } else {
+            ""
+        }
+    );
+
+    if !execute {
+        println!(
+            "{}",
+            "Use --execute to also apply iptables rules immediately.".dimmed()
+        );
+    }
+
+    // Log the patrol action
+    let log_msg = format!(
+        "patrol: banned {} IPs: {}",
+        banned_count,
+        new_attackers
+            .iter()
+            .map(|a| a.ip.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    patrol_log_entry(&log_msg)?;
+
+    Ok(())
+}
+
+async fn patrol_cron(interval: u32, remove: bool, threshold: u32) -> Result<()> {
+    use std::process::Command;
+
+    let i1_path =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("i1"));
+
+    let cron_comment = "# i1 defend patrol - auto-ban attackers";
+    let cron_command = format!(
+        "{} defend patrol run --threshold {} --execute 2>&1 | logger -t i1-patrol",
+        i1_path.display(),
+        threshold
+    );
+
+    if remove {
+        print!("{} Removing patrol cron job... ", "→".cyan());
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let output = Command::new("crontab").arg("-l").output();
+
+        if let Ok(out) = output {
+            let current = String::from_utf8_lossy(&out.stdout);
+            let new_crontab: String = current
+                .lines()
+                .filter(|line| !line.contains("i1 defend patrol"))
+                .filter(|line| !line.contains(cron_comment))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut child = Command::new("crontab")
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                stdin.write_all(new_crontab.as_bytes())?;
+                stdin.write_all(b"\n")?;
+            }
+            child.wait()?;
+
+            println!("{}", "✓".green());
+            println!("Patrol cron job removed.");
+        }
+
+        return Ok(());
+    }
+
+    println!("{}", "━".repeat(60).dimmed());
+    println!("{}", "🔍 SETTING UP PATROL CRON".cyan().bold());
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    let cron_schedule = format!("*/{} * * * *", interval);
+    let cron_line = format!("{} {}", cron_schedule, cron_command);
+
+    println!("Will add to crontab:");
+    println!("  {}", cron_line.dimmed());
+    println!();
+    println!("This will:");
+    println!("  • Scan mailcow nginx logs every {} minutes", interval);
+    println!("  • Auto-ban IPs with {} or more attack hits", threshold);
+    println!("  • Apply iptables rules immediately");
+    println!("  • Log actions to syslog (journalctl -t i1-patrol)");
+    println!();
+
+    // Check if already exists
+    let existing = Command::new("crontab").arg("-l").output();
+    let mut current_crontab = String::new();
+
+    if let Ok(out) = existing {
+        current_crontab = String::from_utf8_lossy(&out.stdout).to_string();
+        if current_crontab.contains("i1 defend patrol") {
+            println!(
+                "{} Patrol cron already exists. Use --remove to delete it first.",
+                "Note:".yellow()
+            );
+            return Ok(());
+        }
+    }
+
+    print!("{} Adding to crontab... ", "→".cyan());
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut child = Command::new("crontab")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        if !current_crontab.is_empty() {
+            stdin.write_all(current_crontab.as_bytes())?;
+            if !current_crontab.ends_with('\n') {
+                stdin.write_all(b"\n")?;
+            }
+        }
+        stdin.write_all(cron_comment.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.write_all(cron_line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+
+    child.wait()?;
+    println!("{}", "✓".green());
+
+    println!();
+    println!("{}", "Patrol is active!".green().bold());
+    println!("Script kiddies will be auto-banned every {} minutes.", interval);
+    println!();
+    println!("Monitor with:");
+    println!("  {} defend patrol log", "i1".cyan());
+    println!("  journalctl -t i1-patrol -f");
+    println!();
+    println!("Remove with:");
+    println!("  {} defend patrol cron --remove", "i1".cyan());
+
+    Ok(())
+}
+
+async fn patrol_log(lines: u32) -> Result<()> {
+    let log_path = patrol_log_path()?;
+
+    println!("{}", "━".repeat(60).dimmed());
+    println!("{}", "🔍 PATROL LOG".cyan().bold());
+    println!("{}", "━".repeat(60).dimmed());
+    println!();
+
+    match std::fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let all_lines: Vec<&str> = content.lines().collect();
+            let start = all_lines.len().saturating_sub(lines as usize);
+            if all_lines.is_empty() {
+                println!("{}", "No patrol activity yet.".dimmed());
+            } else {
+                for line in &all_lines[start..] {
+                    if line.contains("banned") {
+                        println!("  {} {}", "⚠".yellow(), line);
+                    } else if line.contains("clean") {
+                        println!("  {} {}", "✓".green(), line);
+                    } else {
+                        println!("  {}", line);
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            println!("{}", "No patrol activity yet.".dimmed());
+            println!("Run: {} defend patrol run", "i1".cyan());
+        }
+    }
+
+    Ok(())
+}
+
+fn patrol_log_path() -> Result<String> {
+    let data_dir = shellexpand::tilde("~/.local/share/showdi1").to_string();
+    std::fs::create_dir_all(&data_dir)?;
+    Ok(format!("{}/patrol.log", data_dir))
+}
+
+fn patrol_log_entry(msg: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let path = patrol_log_path()?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "[{}] {}", timestamp, msg)?;
     Ok(())
 }
 
