@@ -5,7 +5,6 @@ use crate::cli::commands::Context;
 use crate::defend::State;
 use anyhow::Result;
 use colored::Colorize;
-use i1_providers::HostLookup;
 use std::io::{self, Write};
 
 /// Execute the threat command.
@@ -19,7 +18,7 @@ pub async fn execute(ctx: &Context, args: &ThreatArgs) -> Result<()> {
     println!();
 
     // Try to look up the IP
-    let host_info = match ctx.shodan_provider() {
+    let host_info = match ctx.host_provider() {
         Ok(provider) => match provider.lookup_host(ip).await {
             Ok(info) => Some(info),
             Err(e) => {
@@ -153,7 +152,7 @@ pub async fn lookup_only(ctx: &Context, ip: &str) -> Result<()> {
     println!("{}", "━".repeat(60).dimmed());
     println!();
 
-    let host_info = match ctx.shodan_provider() {
+    let host_info = match ctx.host_provider() {
         Ok(provider) => match provider.lookup_host(ip).await {
             Ok(info) => Some(info),
             Err(e) => {

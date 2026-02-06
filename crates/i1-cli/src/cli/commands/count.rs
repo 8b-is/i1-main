@@ -6,10 +6,9 @@ use colored::Colorize;
 use super::Context;
 use crate::cli::args::CountArgs;
 use crate::output::OutputFormat;
-use i1_providers::SearchProvider;
 
 pub async fn execute(ctx: Context, args: CountArgs) -> Result<()> {
-    let provider = ctx.shodan_provider()?;
+    let provider = ctx.search_provider()?;
 
     let count = provider.count(&args.query).await?;
 

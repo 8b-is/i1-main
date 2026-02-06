@@ -8,7 +8,6 @@ use super::Context;
 use crate::cli::args::HostArgs;
 use crate::output::OutputFormat;
 use i1::HostInfo;
-use i1_providers::HostLookup;
 
 #[derive(Tabled)]
 struct PortRow {
@@ -23,7 +22,7 @@ struct PortRow {
 }
 
 pub async fn execute(ctx: Context, args: HostArgs) -> Result<()> {
-    let provider = ctx.shodan_provider()?;
+    let provider = ctx.host_provider()?;
 
     let host = provider.lookup_host(&args.ip).await?;
 

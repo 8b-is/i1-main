@@ -37,8 +37,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Which provider to use (shodan, censys, criminalip, native, all)
-    #[arg(short, long, global = true, default_value = "shodan")]
+    /// Which provider to use (shodan, censys, criminalip, native, all, auto)
+    #[arg(short, long, global = true, default_value = "auto")]
     pub provider: String,
 
     #[command(subcommand)]

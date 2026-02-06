@@ -39,6 +39,7 @@ pub async fn run() -> Result<()> {
         criminalip_key: std::env::var("I1_CRIMINALIP_KEY")
             .ok()
             .or_else(|| config.criminalip_key.clone()),
+        provider: cli.provider,
         output_format,
         explain: cli.explain,
         verbose: cli.verbose,

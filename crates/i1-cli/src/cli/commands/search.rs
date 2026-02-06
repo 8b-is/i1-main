@@ -7,7 +7,6 @@ use tabled::{settings::Style, Table, Tabled};
 use super::Context;
 use crate::cli::args::SearchArgs;
 use crate::output::OutputFormat;
-use i1_providers::SearchProvider;
 
 #[derive(Tabled)]
 struct SearchRow {
@@ -22,7 +21,7 @@ struct SearchRow {
 }
 
 pub async fn execute(ctx: Context, args: SearchArgs) -> Result<()> {
-    let provider = ctx.shodan_provider()?;
+    let provider = ctx.search_provider()?;
 
     let results = provider.search(&args.query, Some(args.page)).await?;
 
