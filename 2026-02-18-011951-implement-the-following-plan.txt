@@ -1,0 +1,2063 @@
+
+ ▐▛███▜▌   Claude Code v2.1.41
+▝▜█████▛▘  Opus 4.6 · Claude Max
+  ▘▘ ▝▝    ~/Development/i1
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                            │
+│                                                                              │
+│ i1-audit: Zero-Trust Binary & Certificate Audit System                       │
+│                                                                              │
+│ Context                                                                      │
+│                                                                              │
+│ Root CAs are trusted by default on every machine, but "trusting them is only │
+│  as good as trusting that all rich people are perfect law abiding citizens." │
+│  Any entity with enough money can get a root cert installed. Enterprise MDM, │
+│  government mandates, or malware can silently add rogue roots.               │
+│                                                                              │
+│ Similarly, we blindly trust that binaries on our system are what they claim  │
+│ to be. Nobody checks.                                                        │
+│                                                                              │
+│ i1-audit flips this: don't trust authority, trust evidence. A binary's       │
+│ reputation is earned through observable behavior across many machines. A     │
+│ root cert's legitimacy is validated by network consensus, not by the fact    │
+│ that it exists in your local store.                                          │
+│                                                                              │
+│ Multi-factor trust scoring:                                                  │
+│ - Hash (SHA-256) - is this binary known?                                     │
+│ - Create date - when did it appear on disk?                                  │
+│ - Unique ID (inode + device) - has the file been replaced?                   │
+│ - Process name - does it match expectations?                                 │
+│ - Usage metric - derived from (uptime / system_uptime) * (avg_cpu /          │
+│ max_cpu_capability)                                                          │
+│ - Consensus - how many other nodes report the same hash?                     │
+│                                                                              │
+│ Hashes get published to i1-srv DNS zones. More factors confirmed = more      │
+│ credit. The network collectively builds a trust database that no single      │
+│ authority controls.                                                          │
+│                                                                              │
+│ New Crate: crates/i1-audit/                                                  │
+│                                                                              │
+│ crates/i1-audit/                                                             │
+│ ├── Cargo.toml                                                               │
+│ └── src/                                                                     │
+│     ├── lib.rs                    # Re-exports, Result type                  │
+│     ├── error.rs                  # AuditError enum                          │
+│     ├── types/                                                               │
+│     │   ├── mod.rs                # Re-exports                               │
+│     │   ├── binary.rs             # BinaryInfo, FileIdentity                 │
+│     │   ├── process.rs            # ProcessInfo, UsageMetric                 │
+│     │   ├── cert.rs               # RootCertInfo, CertFingerprint            │
+│     │   ├── trust.rs              # TrustScore, CertTrust, TrustWeights      │
+│     │   └── snapshot.rs           # AuditSnapshot, AuditSummary              │
+│     ├── discovery/                                                           │
+│     │   ├── mod.rs                                                           │
+│     │   ├── binaries.rs           # Walk /usr/bin etc, collect metadata      │
+│     │   ├── processes.rs          # Read /proc via procfs crate              │
+│     │   └── certs.rs              # Find & parse root CA stores              │
+│     ├── hash.rs                   # SHA-256 via ring::digest (streaming)     │
+│     ├── scoring/                                                             │
+│     │   ├── mod.rs                                                           │
+│     │   ├── binary_trust.rs       # Multi-factor binary trust scoring        │
+│     │   ├── cert_trust.rs         # Certificate trust scoring                │
+│     │   └── weights.rs            # Configurable weights + defaults          │
+│     ├── encoding/                                                            │
+│     │   ├── mod.rs                                                           │
+│     │   ├── txt_audit.rs          # Hybrid k=v + CBOR (same pattern as       │
+│ i1-srv)                                                                      │
+│     │   └── dns_names.rs          # Hash-prefix DNS name encoding            │
+│     └── consensus/                                                           │
+│         ├── mod.rs                                                           │
+│         ├── query.rs              # Query bin.i1.is / ca.i1.is via DNS       │
+│         └── compare.rs            # Local vs network comparison              │
+│                                                                              │
+│                                                                              │
+│ Key Dependencies                                                             │
+│                                                                              │
+│ ring = "0.17"              # SHA-256 (already in workspace)                  │
+│ walkdir = "2.5"            # Directory traversal for binary discovery        │
+│ procfs = "0.17"            # /proc filesystem for process metrics            │
+│ x509-parser = "0.16"       # Root cert parsing                               │
+│ hex = "0.4"                # Hex encoding for hashes                         │
+│ pem = "3.0"                # PEM file parsing                                │
+│ ciborium = "0.2"           # CBOR overflow encoding                          │
+│ base64 = "0.22"            # Base64 for CBOR-in-TXT                          │
+│ hickory-resolver = { workspace = true }  # DNS consensus queries             │
+│ # Plus workspace: serde, serde_json, thiserror, chrono, tracing, tokio,      │
+│ async-trait                                                                  │
+│                                                                              │
+│ Core Types                                                                   │
+│                                                                              │
+│ BinaryInfo                                                                   │
+│                                                                              │
+│ pub struct BinaryInfo {                                                      │
+│     pub path: String,                                                        │
+│     pub sha256: String,                    // Hex-encoded                    │
+│     pub create_date: DateTime<Utc>,        // statx btime, fallback mtime    │
+│     pub modify_date: DateTime<Utc>,                                          │
+│     pub identity: FileIdentity,            // (inode, device_id)             │
+│     pub size: u64,                                                           │
+│     pub running: bool,                     // Matched from /proc             │
+│     pub process_names: Vec<String>,        // PIDs running this binary       │
+│     pub trust_score: Option<TrustScore>,                                     │
+│ }                                                                            │
+│                                                                              │
+│ UsageMetric                                                                  │
+│                                                                              │
+│ pub struct UsageMetric {                                                     │
+│     pub program_uptime_secs: u64,                                            │
+│     pub system_uptime_secs: u64,                                             │
+│     pub avg_cpu: f64,              // 0.0-1.0                                │
+│     pub max_cpu_capability: f64,   // Number of cores                        │
+│     pub value: f64,                // = (uptime_ratio) * (cpu_ratio)         │
+│ }                                                                            │
+│                                                                              │
+│ TrustScore                                                                   │
+│                                                                              │
+│ pub struct TrustScore {                                                      │
+│     pub total: f64,                // 0.0 = untrusted, 1.0 = fully trusted   │
+│     pub hash_consensus: f64,       // How many nodes report same hash        │
+│     pub age_factor: f64,           // Sigmoid: 0d=0.0, 30d=0.5, 365d≈1.0     │
+│     pub identity_stability: f64,   // Same inode/device over time            │
+│     pub usage_normality: f64,      // Usage pattern matches expectations     │
+│     pub provenance_score: f64,     // Package-managed? dpkg/rpm/pacman       │
+│ }                                                                            │
+│                                                                              │
+│ pub struct TrustWeights {                                                    │
+│     pub hash_consensus: f64,       // 0.40 - consensus is king               │
+│     pub age_factor: f64,           // 0.15                                   │
+│     pub identity_stability: f64,   // 0.15                                   │
+│     pub usage_normality: f64,      // 0.15                                   │
+│     pub provenance_score: f64,     // 0.15                                   │
+│ }                                                                            │
+│                                                                              │
+│ RootCertInfo                                                                 │
+│                                                                              │
+│ pub struct RootCertInfo {                                                    │
+│     pub path: String,                                                        │
+│     pub fingerprint: String,       // SHA-256 of DER bytes, hex              │
+│     pub issuer: String,                                                      │
+│     pub subject: String,                                                     │
+│     pub serial: String,                                                      │
+│     pub not_before: DateTime<Utc>,                                           │
+│     pub not_after: DateTime<Utc>,                                            │
+│     pub expired: bool,                                                       │
+│     pub in_consensus: Option<bool>,   // None until network check            │
+│     pub trust_score: Option<CertTrust>,                                      │
+│ }                                                                            │
+│                                                                              │
+│ AuditSnapshot                                                                │
+│                                                                              │
+│ pub struct AuditSnapshot {                                                   │
+│     pub node_id: String,                                                     │
+│     pub collected_at: DateTime<Utc>,                                         │
+│     pub system_uptime_secs: u64,                                             │
+│     pub cpu_count: u32,                                                      │
+│     pub binaries: Vec<BinaryInfo>,                                           │
+│     pub processes: Vec<ProcessInfo>,                                         │
+│     pub root_certs: Vec<RootCertInfo>,                                       │
+│     pub summary: AuditSummary,                                               │
+│ }                                                                            │
+│                                                                              │
+│ DNS Zone Design                                                              │
+│                                                                              │
+│ Two new zones under i1.is (extending i1-srv's ZoneConfig):                   │
+│                                                                              │
+│ Zone: bin.i1.is.                                                             │
+│ Purpose: Binary hash lookup                                                  │
+│ Example Record: a3f2b8c91d4e.bin.i1.is. 3600 TXT                             │
+│   "name=sshd;size=1047552;trust=87;nodes=142"                                │
+│ ────────────────────────────────────────                                     │
+│ Zone: ca.i1.is.                                                              │
+│ Purpose: Root cert validation                                                │
+│ Example Record: d4e5f6a7b8c9.ca.i1.is. 3600 TXT                              │
+│   "issuer=DigiCert;exp=2038-01-15;nodes=198"                                 │
+│                                                                              │
+│ DNS label = first 12 hex chars of SHA-256 (48 bits, negligible collision     │
+│ risk). Full hash in TXT record.                                              │
+│                                                                              │
+│ Data Flow                                                                    │
+│                                                                              │
+│ Phase 1: Local Collection (no network)                                       │
+│   discover_binaries() + discover_processes() + discover_root_certs()         │
+│   → correlate_processes() → sha256_file() each                               │
+│   → AuditSnapshot                                                            │
+│                                                                              │
+│ Phase 2: Local Trust Scoring (no network)                                    │
+│   score_binary() with age, identity, usage, provenance factors               │
+│   → AuditSnapshot with partial scores (consensus=0.0)                        │
+│                                                                              │
+│ Phase 3: Network Consensus (requires i1-srv)                                 │
+│   query bin.i1.is / ca.i1.is for each hash                                   │
+│   → fill in hash_consensus + network_consensus factors                       │
+│   → compare: flag unknown binaries, rogue certs, missing certs               │
+│                                                                              │
+│ Phase 4: Publish (optional --publish)                                        │
+│   AuditSnapshot → DNS records at bin.i1.is + ca.i1.is                        │
+│   → other nodes can now query our data                                       │
+│                                                                              │
+│                                                                              │
+│ CLI Commands                                                                 │
+│                                                                              │
+│ Add to crates/i1-cli/src/cli/args.rs:                                        │
+│                                                                              │
+│ /// System integrity audit: binary hashes, root certs, trust scoring         │
+│ Audit(AuditArgs),                                                            │
+│                                                                              │
+│ i1 audit binaries              # Hash system binaries, show trust            │
+│ i1 audit binaries --publish    # Hash + publish to network                   │
+│ i1 audit binaries --below 0.5  # Only show low-trust binaries                │
+│ i1 audit processes             # Running process metrics                     │
+│ i1 audit certs                 # Root cert store inventory                   │
+│ i1 audit certs --validate      # Cross-check against consensus               │
+│ i1 audit full                  # Everything                                  │
+│ i1 audit full --json           # Machine-readable                            │
+│                                                                              │
+│                                                                              │
+│ Files to Modify                                                              │
+│                                                                              │
+│ File: Cargo.toml (workspace root)                                            │
+│ Change: Add i1-audit to members + workspace deps                             │
+│ ────────────────────────────────────────                                     │
+│ File: crates/i1-cli/Cargo.toml                                               │
+│ Change: Add i1-audit dependency                                              │
+│ ────────────────────────────────────────                                     │
+│ File: crates/i1-cli/src/cli/args.rs                                          │
+│ Change: Add Audit(AuditArgs) + subcommands                                   │
+│ ────────────────────────────────────────                                     │
+│ File: crates/i1-cli/src/cli/commands/mod.rs                                  │
+│ Change: Add pub mod audit;                                                   │
+│ ────────────────────────────────────────                                     │
+│ File: crates/i1-cli/src/cli/mod.rs                                           │
+│ Change: Wire up audit command dispatch                                       │
+│ ────────────────────────────────────────                                     │
+│ File: crates/i1-srv/src/config.rs                                            │
+│ Change: Add bin + ca zone fields to ZoneConfig                               │
+│                                                                              │
+│ Implementation Phases                                                        │
+│                                                                              │
+│ Phase 1: Core crate + local collection (this session)                        │
+│                                                                              │
+│ 1. Crate scaffolding (Cargo.toml, lib.rs, error.rs, types/)                  │
+│ 2. hash.rs - SHA-256 file hashing via ring                                   │
+│ 3. discovery/binaries.rs - walk dirs, collect metadata                       │
+│ 4. discovery/processes.rs - /proc reading via procfs                         │
+│ 5. discovery/certs.rs - PEM/DER parsing via x509-parser                      │
+│ 6. scoring/ - multi-factor trust scoring (local factors only)                │
+│ 7. CLI: i1 audit binaries, i1 audit processes, i1 audit certs                │
+│                                                                              │
+│ Phase 2: Encoding + DNS publishing                                           │
+│                                                                              │
+│ 8. encoding/txt_audit.rs - hybrid k=v + CBOR                                 │
+│ 9. encoding/dns_names.rs - hash-prefix DNS names                             │
+│ 10. Extend i1-srv zone builder for bin.i1.is + ca.i1.is                      │
+│                                                                              │
+│ Phase 3: Network consensus                                                   │
+│                                                                              │
+│ 11. consensus/query.rs - DNS queries for consensus data                      │
+│ 12. consensus/compare.rs - local vs network comparison                       │
+│ 13. Fill in hash_consensus scoring factor                                    │
+│ 14. CLI: --validate, --publish flags                                         │
+│                                                                              │
+│ Verification                                                                 │
+│                                                                              │
+│ 1. cargo build --workspace compiles                                          │
+│ 2. cargo test -p i1-audit all pass                                           │
+│ 3. cargo clippy -p i1-audit -- -D warnings clean (modulo pre-existing        │
+│ workspace lints)                                                             │
+│ 4. i1 audit binaries discovers and hashes system binaries                    │
+│ 5. i1 audit certs lists root certs with fingerprints                         │
+│ 6. i1 audit processes shows running process metrics                          │
+│ 7. i1 audit full --json produces valid JSON snapshot                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+● I'll start implementing the i1-audit crate. Let me first explore the existing
+  codebase to understand patterns, then build everything out.
+
+● Now let me explore the existing codebase to understand patterns.
+
+● Read 1 file (ctrl+o to expand)
+
+● Explore(Explore existing crate patterns) Sonnet 4.5
+  ⎿  Done (10 tool uses · 59.4k tokens · 2m 57s)
+  (ctrl+o to expand)
+
+❯ You know..  The i1-srv's could implement a really cool TTL checker.  The  
+  program can offer something else really cool.  At any time you can scan a 
+   QR code it saves as a png with your mobile phone (can be on a cell       
+  network or otherwise).  That scan will tell you what one of those very    
+  special TTL DNS strings should read when you scan it and how far off it   
+  is.    Also.. Be sure to check ../i1-dns and ../i1-is  They are the core  
+  servers.                                                                  
+
+● Good context gathered. Now let me check those sibling projects the user
+  mentioned, then proceed with building i1-audit.
+
+● Bash(ls /home/hue/Development/i1-dns 2>/dev/null && echo "---EXISTS---" ||
+      echo "---NOT FOUND---")
+  ⎿  Cargo.lock
+     Cargo.toml
+     deploy
+     … +7 lines (ctrl+o to expand)
+
+● Bash(ls /home/hue/Development/i1-is 2>/dev/null && echo "---EXISTS---" || echo
+       "---NOT FOUND---")
+  ⎿  assets
+     Cargo.lock
+     Cargo.toml
+     … +17 lines (ctrl+o to expand)
+
+● Explore(Explore i1-dns and i1-is) Sonnet 4.5
+  ⎿  Backgrounded agent (shift+↑ to manage · ctrl+o to expand)
+
+● Now let me start building the i1-audit crate. I have enough context from the
+  existing patterns.
+
+● Bash(mkdir -p /home/hue/Development/i1/crates/i1-audit/src/{types,discovery,sc
+      oring,encoding,consensus})
+  ⎿  Done
+
+● Write(crates/i1-audit/Cargo.toml)
+  ⎿  Wrote 54 lines to crates/i1-audit/Cargo.toml
+       1 [package]
+       2 name = "i1-audit"
+       3 version = "0.1.0"
+       4 edition = "2021"
+       5 description = "Zero-trust binary & certificate audit system for 
+         i1.is"
+       6 license = "MIT OR Apache-2.0"
+       7 repository = "https://github.com/i1-is/i1"
+       8 
+       9 [dependencies]
+      10 # Crypto
+     … +44 lines (ctrl+o to expand)
+
+● Now let me write all the core source files. I'll do the error module, types,
+  and lib.rs first.
+
+● Write(crates/i1-audit/src/error.rs)
+  ⎿  Wrote 64 lines to crates/i1-audit/src/error.rs
+       1 //! Error types for the audit system.
+       2 
+       3 use thiserror::Error;
+       4 
+       5 /// Result type alias for audit operations.
+       6 pub type Result<T> = std::result::Result<T, AuditError>;
+       7 
+       8 /// Errors that can occur during audit operations.
+       9 #[derive(Error, Debug)]
+      10 pub enum AuditError {
+     … +54 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/binary.rs)
+  ⎿  Wrote 37 lines to crates/i1-audit/src/types/binary.rs
+       1 //! Binary file information types.
+       2 
+       3 use chrono::{DateTime, Utc};
+       4 use serde::{Deserialize, Serialize};
+       5 
+       6 use super::trust::TrustScore;
+       7 
+       8 /// Unique file identity on disk (inode + device).
+       9 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Des
+         erialize)]
+      10 pub struct FileIdentity {
+     … +27 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/process.rs)
+  ⎿  Wrote 71 lines to crates/i1-audit/src/types/process.rs
+       1 //! Process information types.
+       2 
+       3 use serde::{Deserialize, Serialize};
+       4 
+       5 /// Information about a running process.
+       6 #[derive(Debug, Clone, Serialize, Deserialize)]
+       7 pub struct ProcessInfo {
+       8     /// Process ID
+       9     pub pid: i32,
+      10     /// Process name (comm)
+     … +61 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/cert.rs)
+  ⎿  Wrote 46 lines to crates/i1-audit/src/types/cert.rs
+       1 //! Root certificate information types.
+       2 
+       3 use chrono::{DateTime, Utc};
+       4 use serde::{Deserialize, Serialize};
+       5 
+       6 /// SHA-256 fingerprint of a certificate's DER encoding.
+       7 pub type CertFingerprint = String;
+       8 
+       9 /// Trust assessment for a root certificate.
+      10 #[derive(Debug, Clone, Serialize, Deserialize)]
+     … +36 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/trust.rs)
+  ⎿  Wrote 101 lines to crates/i1-audit/src/types/trust.rs
+       1 //! Trust scoring types and weight configuration.
+       2 
+       3 use serde::{Deserialize, Serialize};
+       4 
+       5 /// Multi-factor trust score for a binary.
+       6 #[derive(Debug, Clone, Serialize, Deserialize)]
+       7 pub struct TrustScore {
+       8     /// Weighted total: 0.0 = untrusted, 1.0 = fully trusted
+       9     pub total: f64,
+      10     /// How many nodes report the same hash (0.0..1.0)
+     … +91 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/snapshot.rs)
+  ⎿  Wrote 69 lines to crates/i1-audit/src/types/snapshot.rs
+       1 //! Audit snapshot — point-in-time system state.
+       2 
+       3 use chrono::{DateTime, Utc};
+       4 use serde::{Deserialize, Serialize};
+       5 
+       6 use super::binary::BinaryInfo;
+       7 use super::cert::RootCertInfo;
+       8 use super::process::ProcessInfo;
+       9 
+      10 /// Complete audit snapshot of a system.
+     … +59 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/mod.rs)
+  ⎿  Wrote 14 lines to crates/i1-audit/src/types/mod.rs
+       1 //! Core types for the audit system.
+       2 
+       3 pub mod binary;
+       4 pub mod cert;
+       5 pub mod process;
+       6 pub mod snapshot;
+       7 pub mod trust;
+       8 
+       9 pub use binary::{BinaryInfo, FileIdentity};
+      10 pub use cert::{CertFingerprint, CertTrust, RootCertInfo};
+     … +4 lines (ctrl+o to expand)
+
+● Now the hash module and discovery modules:
+
+● Write(crates/i1-audit/src/hash.rs)
+  ⎿  Wrote 85 lines to crates/i1-audit/src/hash.rs
+       1 //! Streaming SHA-256 hashing via `ring::digest`.
+       2 
+       3 use ring::digest::{Context, SHA256};
+       4 use std::path::Path;
+       5 use tokio::io::AsyncReadExt;
+       6 
+       7 use crate::error::{AuditError, Result};
+       8 
+       9 /// Buffer size for streaming file reads (64 KiB).
+      10 const BUF_SIZE: usize = 64 * 1024;
+     … +75 lines (ctrl+o to expand)
+
+● Now the discovery modules:
+
+● Write(crates/i1-audit/src/discovery/binaries.rs)
+  ⎿  Wrote 144 lines to crates/i1-audit/src/discovery/binaries.rs
+       1 //! Binary discovery — walk standard paths and collect metadata.
+       2 
+       3 use chrono::{DateTime, TimeZone, Utc};
+       4 use std::os::unix::fs::MetadataExt;
+       5 use std::path::Path;
+       6 use tracing::{debug, warn};
+       7 use walkdir::WalkDir;
+       8 
+       9 use crate::error::{AuditError, Result};
+      10 use crate::hash::sha256_file;
+     … +134 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/discovery/processes.rs)
+  ⎿  Wrote 117 lines to crates/i1-audit/src/discovery/processes.rs
+       1 //! Process discovery via `/proc` filesystem.
+       2 
+       3 use tracing::{debug, warn};
+       4 
+       5 use crate::error::{AuditError, Result};
+       6 use crate::types::{ProcessInfo, UsageMetric};
+       7 
+       8 /// Discover all running processes from `/proc`.
+       9 ///
+      10 /// Uses the `procfs` crate for safe, structured access.
+     … +107 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/discovery/certs.rs)
+  ⎿  Wrote 162 lines to crates/i1-audit/src/discovery/certs.rs
+      1 //! Root certificate store discovery and parsing.
+      2 
+      3 use chrono::{DateTime, TimeZone, Utc};
+      4 use std::path::Path;
+      5 use tracing::{debug, warn};
+      6 
+      7 use crate::error::{AuditError, Result};
+      8 use crate::hash::sha256_bytes;
+      9 use crate::types::RootCertInfo;
+     … +152 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/discovery/mod.rs)
+  ⎿  Wrote 10 lines to crates/i1-audit/src/discovery/mod.rs
+      1 //! System discovery — binaries, processes, and root certificates
+        .
+      2 
+      3 pub mod binaries;
+      4 pub mod certs;
+      5 pub mod processes;
+      6 
+      7 pub use binaries::{correlate_processes, discover_binaries, DEFAUL
+        T_BIN_PATHS};
+      8 pub use certs::discover_root_certs;
+      9 pub use processes::{discover_processes, get_cpu_count, get_system
+        _uptime};
+
+● Now the scoring modules:
+
+● Write(crates/i1-audit/src/scoring/weights.rs)
+  ⎿  Wrote 28 lines to crates/i1-audit/src/scoring/weights.rs
+       1 //! Trust weight presets.
+       2 
+       3 use crate::types::TrustWeights;
+       4 
+       5 /// Offline-only weights: no network consensus available, redist
+         ribute its weight.
+       6 ///
+       7 /// Used when running without i1-srv connectivity.
+       8 pub fn offline_weights() -> TrustWeights {
+       9     TrustWeights {
+      10         hash_consensus: 0.0,
+     … +18 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/scoring/binary_trust.rs)
+  ⎿  Wrote 174 lines to crates/i1-audit/src/scoring/binary_trust.rs
+       1 //! Multi-factor trust scoring for binaries.
+       2 
+       3 use chrono::Utc;
+       4 use std::process::Command;
+       5 
+       6 use crate::types::{BinaryInfo, TrustScore, TrustWeights};
+       7 
+       8 /// Score a binary's trustworthiness using local factors.
+       9 ///
+      10 /// Network consensus factor (`hash_consensus`) is left at 0.0 u
+         ntil
+     … +164 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/scoring/cert_trust.rs)
+  ⎿  Wrote 117 lines to crates/i1-audit/src/scoring/cert_trust.rs
+      1 //! Certificate trust scoring.
+      2 
+      3 use crate::types::{CertTrust, RootCertInfo};
+      4 
+      5 /// Score a root certificate's trustworthiness.
+      6 ///
+      7 /// Local factors only — network consensus filled in later.
+      8 pub fn score_cert(cert: &RootCertInfo) -> CertTrust {
+      9     let validity_ok = !cert.expired;
+     … +107 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/scoring/mod.rs)
+  ⎿  Wrote 10 lines to crates/i1-audit/src/scoring/mod.rs
+      1 //! Trust scoring for binaries and certificates.
+      2 
+      3 pub mod binary_trust;
+      4 pub mod cert_trust;
+      5 pub mod weights;
+      6 
+      7 pub use binary_trust::score_binary;
+      8 pub use cert_trust::score_cert;
+      9 pub use weights::{offline_weights, paranoid_weights};
+
+● Now the encoding and consensus stubs:
+
+● Write(crates/i1-audit/src/encoding/dns_names.rs)
+  ⎿  Wrote 63 lines to crates/i1-audit/src/encoding/dns_names.rs
+       1 //! DNS name encoding for hash-prefix lookups.
+       2 //!
+       3 //! Binary hashes are published as DNS TXT records under `bin.i1
+         .is.`
+       4 //! and certificate fingerprints under `ca.i1.is.`.
+       5 //!
+       6 //! DNS label = first 12 hex chars of SHA-256 (48 bits).
+       7 //! Full hash is stored inside the TXT record value.
+       8 
+       9 /// Zone suffix for binary hash lookups.
+      10 pub const BIN_ZONE: &str = "bin.i1.is.";
+     … +53 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/encoding/txt_audit.rs)
+  ⎿  Wrote 120 lines to crates/i1-audit/src/encoding/txt_audit.rs
+       1 //! Hybrid key=value + CBOR encoding for DNS TXT records.
+       2 //!
+       3 //! Small payloads use plain `k=v;k=v` pairs.
+       4 //! When the payload exceeds the ~255-byte TXT record limit,
+       5 //! overflow fields are CBOR-encoded and base64-appended.
+       6 
+       7 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+       8 
+       9 use crate::error::{AuditError, Result};
+      10 use crate::types::BinaryInfo;
+     … +110 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/encoding/mod.rs)
+  ⎿  Wrote 8 lines to crates/i1-audit/src/encoding/mod.rs
+      1 //! DNS record encoding for audit data.
+      2 
+      3 pub mod dns_names;
+      4 pub mod txt_audit;
+      5 
+      6 pub use dns_names::{binary_dns_name, cert_dns_name, BIN_ZONE, CA_
+        ZONE};
+      7 pub use txt_audit::{encode_binary_txt, encode_cert_txt};
+
+● Now the consensus stubs:
+
+● Write(crates/i1-audit/src/consensus/query.rs)
+  ⎿  Wrote 123 lines to crates/i1-audit/src/consensus/query.rs
+       1 //! DNS consensus queries against bin.i1.is / ca.i1.is.
+       2 //!
+       3 //! Phase 3 implementation — queries the network to see how many
+       4 //! other nodes report the same binary hash or cert fingerprint.
+       5 
+       6 use hickory_resolver::TokioAsyncResolver;
+       7 use tracing::{debug, warn};
+       8 
+       9 use crate::encoding::{binary_dns_name, cert_dns_name};
+      10 use crate::error::{AuditError, Result};
+     … +113 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/consensus/compare.rs)
+  ⎿  Wrote 127 lines to crates/i1-audit/src/consensus/compare.rs
+       1 //! Local vs network comparison — flag anomalies.
+       2 //!
+       3 //! After consensus queries, compare local state to what the net
+         work knows.
+       4 //! Unknown binaries or certs that aren't in consensus are flagg
+         ed.
+       5 
+       6 use crate::types::{BinaryInfo, RootCertInfo};
+       7 
+       8 /// Anomaly detected during comparison.
+       9 #[derive(Debug, Clone)]
+      10 pub struct Anomaly {
+     … +117 lines (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/consensus/mod.rs)
+  ⎿  Wrote 10 lines to crates/i1-audit/src/consensus/mod.rs
+      1 //! Network consensus — query and compare against community data.
+      2 
+      3 pub mod compare;
+      4 pub mod query;
+      5 
+      6 pub use compare::{compare_binaries, compare_certs, Anomaly, Anoma
+        lyKind, Severity};
+      7 pub use query::{
+      8     create_resolver, query_binary_consensus, query_cert_consensus
+        , ConsensusResult,
+      9 };
+
+● Now the main lib.rs:
+
+● Write(crates/i1-audit/src/lib.rs)
+  ⎿  Wrote 113 lines to crates/i1-audit/src/lib.rs
+       1 //! # i1-audit
+       2 //!
+       3 //! Zero-trust binary & certificate audit system.
+       4 //!
+       5 //! Don't trust authority, trust evidence. A binary's reputation
+          is earned
+       6 //! through observable behavior across many machines. A root cer
+         t's legitimacy
+       7 //! is validated by network consensus, not by the fact that it e
+         xists in your
+       8 //! local trust store.
+       9 //!
+      10 //! ## Multi-Factor Trust Scoring
+     … +103 lines (ctrl+o to expand)
+
+● Now let me add hostname to Cargo.toml since I used it in lib.rs, and wire up
+  the workspace + CLI:
+
+● Update(crates/i1-audit/Cargo.toml)
+  ⎿  Added 3 lines
+      45  # Logging
+      46  tracing = { workspace = true }
+      47  
+      48 +# System info                                                  
+      49 +hostname = "0.4"                                               
+      50 +                                                               
+      51  [dev-dependencies]
+      52  tempfile = "3.14"
+      53  tokio-test = { workspace = true }
+
+● Now update workspace root Cargo.toml:
+
+● Update(Cargo.toml)
+  ⎿  Added 1 line
+      14      "crates/i1-honeypot",
+      15      "crates/i1-ca",
+      16      "crates/i1-srv",
+      17 +    "crates/i1-audit",                                         
+      18  ]
+      19  
+      20  [workspace.package]
+
+● Update(Cargo.toml)
+  ⎿  Added 1 line
+      73  i1-native = { path = "crates/i1-native" }
+      74  i1-honeypot = { path = "crates/i1-honeypot" }
+      75  i1-srv = { path = "crates/i1-srv" }
+      76 +i1-audit = { path = "crates/i1-audit" }                        
+      77  
+      78  # Testing
+      79  wiremock = "0.6"
+
+● Now add i1-audit to the CLI's Cargo.toml:
+
+● Update(crates/i1-cli/Cargo.toml)
+  ⎿  File must be read first
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-cli/Cargo.toml)
+  ⎿  Added 1 line
+      29  i1 = { path = "../i1" }
+      30  i1-core = { path = "../i1-core" }
+      31  i1-providers = { path = "../i1-providers" }
+      32 +i1-audit = { path = "../i1-audit" }                            
+      33  
+      34  # CLI framework
+      35  clap = { version = "4.5", features = ["derive", "env", "wrap_he
+          lp", "color"] }
+
+● Now add the Audit command to args.rs and create the command handler. Let me
+  read the current args.rs to add the new command:
+
+● Update(crates/i1-cli/src/cli/args.rs)
+  ⎿  File must be read first
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-cli/src/cli/args.rs)
+  ⎿  Added 3 lines
+      71      /// Quick threat response: lookup + optional ban in one com
+          mand
+      72      #[command(alias = "t")]
+      73      Threat(ThreatArgs),
+      74 +                                                               
+      75 +    /// System integrity audit: binary hashes, root certs, trus
+         +t scoring                                                      
+      76 +    Audit(AuditArgs),                                          
+      77  }
+      78  
+      79  // ============================================================
+          ================
+
+● Now add the AuditArgs definitions at the end of args.rs:
+
+● Update(crates/i1-cli/src/cli/args.rs)
+  ⎿  Added 45 lines
+      481      /// Show config file path
+      482      Path,
+      483  }
+      484 +                                                              
+      485 +// ===========================================================
+          +=================                                             
+      486 +// Audit command                                              
+      487 +// ===========================================================
+          +=================                                             
+      488 +                                                              
+      489 +#[derive(Args, Debug)]                                        
+      490 +pub struct AuditArgs {                                        
+      491 +    #[command(subcommand)]                                    
+      492 +    pub command: AuditCommands,                               
+      493 +}                                                             
+      494 +                                                              
+      495 +#[derive(Subcommand, Debug)]                                  
+      496 +pub enum AuditCommands {                                      
+      497 +    /// Hash system binaries and show trust scores            
+      498 +    Binaries {                                                
+      499 +        /// Publish hashes to the i1.is network               
+      500 +        #[arg(long)]                                          
+      501 +        publish: bool,                                        
+      502 +                                                              
+      503 +        /// Only show binaries below this trust threshold (0.0
+          +-1.0)                                                         
+      504 +        #[arg(long)]                                          
+      505 +        below: Option<f64>,                                   
+      506 +                                                              
+      507 +        /// Additional paths to scan (besides system defaults)
+      508 +        #[arg(long, value_delimiter = ',')]                   
+      509 +        paths: Option<Vec<String>>,                           
+      510 +    },                                                        
+      511 +                                                              
+      512 +    /// Show running process metrics                          
+      513 +    Processes,                                                
+      514 +                                                              
+      515 +    /// Root certificate store inventory                      
+      516 +    Certs {                                                   
+      517 +        /// Cross-check certs against network consensus       
+      518 +        #[arg(long)]                                          
+      519 +        validate: bool,                                       
+      520 +    },                                                        
+      521 +                                                              
+      522 +    /// Full system audit (binaries + processes + certs)      
+      523 +    Full {                                                    
+      524 +        /// Publish results to the i1.is network              
+      525 +        #[arg(long)]                                          
+      526 +        publish: bool,                                        
+      527 +    },                                                        
+      528 +}                                                             
+
+● Now create the audit command handler:
+
+● Write(crates/i1-cli/src/cli/commands/audit.rs)
+  ⎿  Wrote 304 lines to crates/i1-cli/src/cli/commands/audit.rs
+      1 //! Audit command implementation — system integrity checks.
+      2 
+      3 use anyhow::Result;
+      4 use colored::Colorize;
+      5 
+      6 use crate::cli::args::{AuditArgs, AuditCommands};
+      7 use crate::output::OutputFormat;
+      8 
+      9 use super::Context;
+     … +294 lines (ctrl+o to expand)
+
+● Now wire it up in the commands mod.rs and dispatch in mod.rs:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-cli/src/cli/commands/mod.rs)
+  ⎿  Added 1 line
+      1  //! Command implementations.
+      2  
+      3 +pub mod audit;                                                  
+      4  pub mod config;
+      5  pub mod count;
+      6  pub mod defend;
+
+● Now wire up dispatch in cli/mod.rs:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-cli/src/cli/mod.rs)
+  ⎿  Added 1 line
+      56          Some(Commands::Defend(args)) => commands::defend::execu
+          te(ctx, args).await,
+      57          Some(Commands::Config(args)) => commands::config::execu
+          te(ctx, args).await,
+      58          Some(Commands::Threat(args)) => commands::threat::execu
+          te(&ctx, &args).await,
+      59 +        Some(Commands::Audit(args)) => commands::audit::execute
+         +(ctx, args).await,                                             
+      60          None => commands::scan::execute(ctx).await,
+      61      }
+      62  }
+
+● Now let's try to build:
+
+● Bash(cargo build -p i1-audit 2>&1 | head -80)
+  ⎿      Updating crates.io index
+          Locking 19 packages to latest compatible versions
+           Adding asn1-rs v0.6.2
+     … +34 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● Good progress - it's compiling. Let me see the rest:
+
+● Bash(cargo build -p i1-audit 2>&1 | tail -30)
+  ⎿  error[E0282]: type annotations needed
+        --> crates/i1-audit/src/discovery/processes.rs:107:15
+         |
+     … +21 lines (ctrl+o to expand)
+
+● Let me see all the errors:
+
+● Bash(cargo build -p i1-audit 2>&1 | grep "^error")
+  ⎿  error[E0599]: no function or associated item named `tokio_from_system_
+     conf` found for struct `Resolver<P>` in the current scope
+     error[E0599]: no function or associated item named `current` found for
+     … +9 lines (ctrl+o to expand)
+
+● API differences in the versions of procfs and hickory-resolver. Let me fix
+  these.
+
+● Bash(cargo build -p i1-audit 2>&1 | grep "error\[" -A 5)
+  ⎿  error[E0599]: no function or associated item named `tokio_from_system_
+     conf` found for struct `Resolver<P>` in the current scope
+        --> crates/i1-audit/src/consensus/query.rs:105:40
+     … +24 lines (ctrl+o to expand)
+
+● Let me check the procfs API for v0.17 and fix the hickory resolver API:
+
+● Searched for 2 patterns (ctrl+o to expand)
+
+● The Current trait is what provides the ::current() method. I need to import
+  it:
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● Good, Uptime does implement Current. I need to import the trait. Let me also
+  check the hickory resolver:
+
+● Searched for 2 patterns (ctrl+o to expand)
+
+● It uses builder_tokio() now. Let me check how to use it:
+
+● Searched for 2 patterns (ctrl+o to expand)
+
+● Now I know the API. Let me also check what's available on the type alias:
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● Now I have the info. Let me fix all the issues:
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/consensus/query.rs)
+  ⎿  Added 9 lines, removed 8 lines
+       3  //! Phase 3 implementation — queries the network to see how man
+          y
+       4  //! other nodes report the same binary hash or cert fingerprint
+          .
+       5  
+       6 -use hickory_resolver::TokioAsyncResolver;                      
+       7 -use tracing::{debug, warn};                                    
+       6 +use hickory_resolver::TokioResolver;                           
+       7 +use tracing::debug;                                            
+       8  
+       9  use crate::encoding::{binary_dns_name, cert_dns_name};
+      10  use crate::error::{AuditError, Result};
+     ...
+      24  
+      25  /// Query the network for a binary hash consensus.
+      26  pub async fn query_binary_consensus(
+      27 -    resolver: &TokioAsyncResolver,                             
+      27 +    resolver: &TokioResolver,                                  
+      28      sha256: &str,
+      29  ) -> Result<ConsensusResult> {
+      30      let name = binary_dns_name(sha256);
+     ...
+      33  
+      34  /// Query the network for a certificate fingerprint consensus.
+      35  pub async fn query_cert_consensus(
+      36 -    resolver: &TokioAsyncResolver,                             
+      36 +    resolver: &TokioResolver,                                  
+      37      fingerprint: &str,
+      38  ) -> Result<ConsensusResult> {
+      39      let name = cert_dns_name(fingerprint);
+     ...
+      42  
+      43  /// Generic TXT record query and parse.
+      44  async fn query_txt_record(
+      45 -    resolver: &TokioAsyncResolver,                             
+      45 +    resolver: &TokioResolver,                                  
+      46      dns_name: &str,
+      47      hash: &str,
+      48  ) -> Result<ConsensusResult> {
+     ...
+      101  ///
+      102  /// Uses system resolver by default. In production, could be c
+           onfigured
+      103  /// to use specific nameservers for the i1.is zone.
+      104 -pub async fn create_resolver() -> Result<TokioAsyncResolver> {
+      105 -    let resolver = TokioAsyncResolver::tokio_from_system_conf(
+          -)                                                             
+      106 -        .map_err(|e| AuditError::DnsQuery(format!("failed to c
+          -reate resolver: {e}")))?;                                     
+      104 +pub fn create_resolver() -> Result<TokioResolver> {           
+      105 +    let resolver = TokioResolver::builder_tokio()             
+      106 +        .map_err(|e| AuditError::DnsQuery(format!("failed to c
+          +reate resolver: {e}")))?                                      
+      107 +        .build();                                             
+      108      Ok(resolver)
+      109  }
+      110  
+
+● Now fix the procfs issues in processes.rs:
+
+● Read 1 file (ctrl+o to expand)
+
+● I need to import the Current trait from procfs:
+
+● Write(crates/i1-audit/src/discovery/processes.rs)
+  ⎿  Added 5 lines, removed 3 lines
+      1  //! Process discovery via `/proc` filesystem.
+      2  
+      3 -use tracing::{debug, warn};                                     
+      3 +use procfs::prelude::*;                                         
+      4 +use tracing::debug;                                             
+      5  
+      6  use crate::error::{AuditError, Result};
+      7  use crate::types::{ProcessInfo, UsageMetric};
+     ...
+       98  
+       99  /// Get system uptime in seconds.
+      100  pub fn get_system_uptime() -> Result<u64> {
+      100 -    let uptime = procfs::Uptime::current().map_err(|e| AuditEr
+          -ror::Procfs(e.to_string()))?;                                 
+      101 +    let uptime =                                              
+      102 +        procfs::Uptime::current().map_err(|e| AuditError::Proc
+          +fs(e.to_string()))?;                                          
+      103      Ok(uptime.uptime as u64)
+      104  }
+      105  
+      106  /// Get number of CPU cores.
+      107  pub fn get_cpu_count() -> u32 {
+      108      procfs::CpuInfo::current()
+      107 -        .map(|c| c.num_cores() as u32)                        
+      109 +        .map(|c: procfs::CpuInfo| c.num_cores() as u32)       
+      110          .unwrap_or(1)
+      111  }
+      112  
+
+● Now fix the cert_trust.rs clamp issue:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-audit/src/scoring/cert_trust.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      12      let known_issuer = is_known_issuer(&cert.issuer);
+      13  
+      14      // Base score from local factors
+      15 -    let mut score = 0.0;                                       
+      15 +    let mut score: f64 = 0.0;                                  
+      16      if validity_ok {
+      17          score += 0.3;
+      18      }
+     ...
+      20          score += 0.3;
+      21      }
+      22      // Network consensus adds up to 0.4 (filled in Phase 3)
+      23 -    let network_consensus = 0.0;                               
+      23 +    let network_consensus: f64 = 0.0;                          
+      24  
+      25      CertTrust {
+      26          score: (score + network_consensus).clamp(0.0, 1.0),
+
+● Also need to update the consensus/mod.rs export since we changed
+  TokioAsyncResolver to TokioResolver:
+
+● Bash(cargo build -p i1-audit 2>&1 | grep "^error" )
+  ⎿  No matches found
+
+● Clean build. Now let's check warnings and run clippy:
+
+● Bash(cargo build -p i1-audit 2>&1)
+  ⎿  warning: unused variable: `min_node_threshold`
+       --> crates/i1-audit/src/consensus/compare.rs:45:50
+        |
+     … +13 lines (ctrl+o to expand)
+
+● Just one warning. Let me fix it:
+
+● Update(crates/i1-audit/src/consensus/compare.rs)
+  ⎿  Added 1 line, removed 1 line
+      42  ///
+      43  /// Returns anomalies for binaries that the network doesn't kno
+          w about
+      44  /// or that have suspiciously few reports.
+      45 -pub fn compare_binaries(binaries: &[BinaryInfo], min_node_thres
+         -hold: u32) -> Vec<Anomaly> {                                   
+      45 +pub fn compare_binaries(binaries: &[BinaryInfo], _min_node_thre
+         +shold: u32) -> Vec<Anomaly> {                                  
+      46      let mut anomalies = Vec::new();
+      47  
+      48      for bin in binaries {
+
+● Now run clippy:
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1)
+  ⎿  Error: Exit code 101
+        Compiling num-conv v0.2.0
+        Compiling time-core v0.1.8
+         Checking futures-core v0.3.32
+         Checking nom v7.1.3
+         Checking hex v0.4.3
+         Checking linux-raw-sys v0.4.15
+         Checking ipnet v2.11.0
+         Checking num-traits v0.2.19
+         Checking same-file v1.0.6
+     … +202 lines (ctrl+o to see all)
+
+● Many clippy pedantic warnings. Let me fix them systematically. The biggest
+  categories are: cargo metadata, must_use, cast precision, mul_add, and doc
+  comments. Let me batch-fix everything.
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-audit/Cargo.toml)
+  ⎿  Added 2 lines
+       5  description = "Zero-trust binary & certificate audit system for
+           i1.is"
+       6  license = "MIT OR Apache-2.0"
+       7  repository = "https://github.com/i1-is/i1"
+       8 +keywords = ["security", "audit", "trust", "binary-analysis", "c
+         +ertificates"]                                                  
+       9 +categories = ["command-line-utilities", "network-programming"] 
+      10  
+      11  [dependencies]
+      12  # Crypto
+
+● Now let me fix all the clippy issues across the source files. I'll use a
+  systematic approach — fix per file:
+
+● Write(crates/i1-audit/src/types/trust.rs)
+  ⎿  Added 3 lines, removed 2 lines
+       9      pub total: f64,
+      10      /// How many nodes report the same hash (0.0..1.0)
+      11      pub hash_consensus: f64,
+      12 -    /// Age factor: sigmoid curve (0d=0.0, 30d≈0.5, 365d≈1.0)  
+      12 +    /// Age factor: sigmoid curve (0d=0.0, 30d~0.5, 365d~1.0)  
+      13      pub age_factor: f64,
+      14      /// Same inode/device over time (stable = 1.0)
+      15      pub identity_stability: f64,
+     ...
+      21  
+      22  impl TrustScore {
+      23      /// Compute weighted total from individual factors.
+      24 +    #[allow(clippy::suboptimal_flops)]                         
+      25      pub fn compute(
+      26          hash_consensus: f64,
+      27          age_factor: f64,
+     ...
+      52  /// All weights should sum to 1.0.
+      53  #[derive(Debug, Clone, Serialize, Deserialize)]
+      54  pub struct TrustWeights {
+      54 -    /// Consensus is king — how many nodes agree on this hash  
+      55 +    /// Consensus is king -- how many nodes agree on this hash 
+      56      pub hash_consensus: f64,
+      57      /// How old the file is (older = more trusted)
+      58      pub age_factor: f64,
+
+● Write(crates/i1-audit/src/types/process.rs)
+  ⎿  Added 2 lines, removed 1 line
+      24  /// `value = (program_uptime / system_uptime) * (avg_cpu / max_
+          cpu_capability)`
+      25  ///
+      26  /// A high value means the process has been running long and co
+          nsuming
+      27 -/// significant CPU — worth paying attention to.               
+      27 +/// significant CPU -- worth paying attention to.              
+      28  #[derive(Debug, Clone, Serialize, Deserialize)]
+      29  pub struct UsageMetric {
+      30      /// How long this process has been alive (seconds)
+     ...
+      41  
+      42  impl UsageMetric {
+      43      /// Compute the usage metric from raw values.
+      44 +    #[allow(clippy::cast_precision_loss)]                      
+      45      pub fn compute(
+      46          program_uptime_secs: u64,
+      47          system_uptime_secs: u64,
+
+● Now fix lib.rs:
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/lib.rs)
+  ⎿  Added 20 lines, removed 15 lines
+       9  //!
+      10  //! ## Multi-Factor Trust Scoring
+      11  //!
+      12 -//! - **Hash** (SHA-256) — is this binary known?               
+      13 -//! - **Create date** — when did it appear on disk?            
+      14 -//! - **Unique ID** (inode + device) — has the file been replac
+         -ed?                                                            
+      15 -//! - **Process name** — does it match expectations?           
+      16 -//! - **Usage metric** — `(uptime / system_uptime) * (avg_cpu /
+         - max_cpu)`                                                     
+      17 -//! - **Consensus** — how many other nodes report the same hash
+         -?                                                              
+      12 +//! - **Hash** (SHA-256) -- is this binary known?              
+      13 +//! - **Create date** -- when did it appear on disk?           
+      14 +//! - **Unique ID** (inode + device) -- has the file been repla
+         +ced?                                                           
+      15 +//! - **Process name** -- does it match expectations?          
+      16 +//! - **Usage metric** -- `(uptime / system_uptime) * (avg_cpu 
+         +/ max_cpu)`                                                    
+      17 +//! - **Consensus** -- how many other nodes report the same has
+         +h?                                                             
+      18  //!
+      19  //! ## Data Flow
+      20  //!
+      21  //! ```text
+      22  //! Phase 1: Local Collection (no network)
+      23  //!   discover_binaries() + discover_processes() + discover_roo
+          t_certs()
+      24 -//!   → correlate_processes() → sha256_file() each             
+      25 -//!   → AuditSnapshot                                          
+      24 +//!   -> correlate_processes() -> sha256_file() each           
+      25 +//!   -> AuditSnapshot                                         
+      26  //!
+      27  //! Phase 2: Local Trust Scoring (no network)
+      28  //!   score_binary() with age, identity, usage, provenance fact
+          ors
+      29 -//!   → AuditSnapshot with partial scores (consensus=0.0)      
+      29 +//!   -> AuditSnapshot with partial scores (consensus=0.0)     
+      30  //!
+      31  //! Phase 3: Network Consensus (requires i1-srv)
+      32  //!   query bin.i1.is / ca.i1.is for each hash
+      33 -//!   → fill in hash_consensus + network_consensus factors     
+      33 +//!   -> fill in hash_consensus + network_consensus factors    
+      34  //!
+      35  //! Phase 4: Publish (optional --publish)
+      36 -//!   AuditSnapshot → DNS records at bin.i1.is + ca.i1.is      
+      36 +//!   AuditSnapshot -> DNS records at bin.i1.is + ca.i1.is     
+      37  //! ```
+      38  
+      39  pub mod consensus;
+     ...
+      52  /// Collect a full audit snapshot of the local system.
+      53  ///
+      54  /// Runs Phases 1 & 2: local discovery + local trust scoring.
+      55 -/// Network consensus (Phase 3) is not included — call consensu
+         -s                                                              
+      55 +/// Network consensus (Phase 3) is not included -- call consens
+         +us                                                             
+      56  /// queries separately.
+      57 +///                                                            
+      58 +/// # Errors                                                   
+      59 +///                                                            
+      60 +/// Returns `AuditError` if process discovery or binary discove
+         +ry fails.                                                      
+      61  pub async fn collect_snapshot(
+      62      bin_paths: &[&str],
+      63      weights: &TrustWeights,
+     ...
+      110      }
+      111  
+      112      // Fallback: hostname
+      109 -    hostname::get()                                           
+      110 -        .map(|h| h.to_string_lossy().into_owned())            
+      111 -        .unwrap_or_else(|_| "unknown".to_string())            
+      113 +    hostname::get().map_or_else(                              
+      114 +        |_| "unknown".to_string(),                            
+      115 +        |h| h.to_string_lossy().into_owned(),                 
+      116 +    )                                                         
+      117  }
+
+● Now fix the remaining files. Let me fix all the clippy issues in bulk. The
+  main patterns are: must_use, #[doc] errors, const fn suggestions, and cast
+  precision loss.
+
+● Write(crates/i1-audit/src/scoring/weights.rs)
+  ⎿  Added 4 lines, removed 2 lines
+       5  /// Offline-only weights: no network consensus available, redis
+          tribute its weight.
+       6  ///
+       7  /// Used when running without i1-srv connectivity.
+       8 -pub fn offline_weights() -> TrustWeights {                     
+       8 +#[must_use]                                                    
+       9 +pub const fn offline_weights() -> TrustWeights {               
+      10      TrustWeights {
+      11          hash_consensus: 0.0,
+      12          age_factor: 0.30,
+     ...
+      17  }
+      18  
+      19  /// Paranoid weights: consensus matters most, age matters least
+          .
+      19 -pub fn paranoid_weights() -> TrustWeights {                    
+      20 +#[must_use]                                                    
+      21 +pub const fn paranoid_weights() -> TrustWeights {              
+      22      TrustWeights {
+      23          hash_consensus: 0.50,
+      24          age_factor: 0.10,
+
+● Write(crates/i1-audit/src/hash.rs)
+  ⎿  Added 5 lines, removed 2 lines
+      12  /// Compute SHA-256 of a file, streaming to avoid loading it al
+          l into memory.
+      13  ///
+      14  /// Returns lowercase hex-encoded digest.
+      15 +///                                                            
+      16 +/// # Errors                                                   
+      17 +///                                                            
+      18 +/// Returns `AuditError::Io` if the file cannot be opened or re
+         +ad.                                                            
+      19  pub async fn sha256_file(path: &Path) -> Result<String> {
+      20      let path_str = path.display().to_string();
+      21      let mut file = tokio::fs::File::open(path)
+     ...
+      41  }
+      42  
+      43  /// Compute SHA-256 of raw bytes (for certificate DER data).
+      44 +#[must_use]                                                    
+      45  pub fn sha256_bytes(data: &[u8]) -> String {
+      46      let digest = ring::digest::digest(&SHA256, data);
+      47      hex::encode(digest.as_ref())
+     ...
+      60          tmp.flush().unwrap();
+      61  
+      62          let hash = sha256_file(tmp.path()).await.unwrap();
+      58 -        // Known SHA-256 of "hello world"                      
+      63          assert_eq!(
+      64              hash,
+      65              "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee90
+          88f7ace2efcde9"
+     ...
+      79      async fn test_sha256_empty_file() {
+      80          let tmp = NamedTempFile::new().unwrap();
+      81          let hash = sha256_file(tmp.path()).await.unwrap();
+      78 -        // SHA-256 of empty input                              
+      82          assert_eq!(
+      83              hash,
+      84              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
+          95991b7852b855"
+
+● Now let me fix all remaining files in parallel:
+
+● Write(crates/i1-audit/src/discovery/binaries.rs)
+  ⎿  Added 14 lines, removed 14 lines
+      1 -//! Binary discovery — walk standard paths and collect metadata.
+      1 +//! Binary discovery -- walk standard paths and collect metadata
+        +.                                                               
+      2  
+      3  use chrono::{DateTime, TimeZone, Utc};
+      4  use std::os::unix::fs::MetadataExt;
+     ...
+      25  /// Walks each directory, skipping symlinks-to-nowhere and unre
+          adable files.
+      26  /// Returns `BinaryInfo` with hashes but without process correl
+          ation (that's
+      27  /// done by `correlate_processes`).
+      28 +///                                                            
+      29 +/// # Errors                                                   
+      30 +///                                                            
+      31 +/// Returns `AuditError` if directory walking fails catastrophi
+         +cally.                                                         
+      32  pub async fn discover_binaries(paths: &[&str]) -> Result<Vec<Bi
+          naryInfo>> {
+      33      let mut binaries = Vec::new();
+      34  
+     ...
+      84      let modify_date = timestamp_to_utc(mtime);
+      85  
+      86      // Try creation time (btime via statx), fall back to mtime
+      83 -    let create_date = {                                        
+      84 -        match meta.created() {                                 
+      85 -            Ok(created) => {                                   
+      86 -                let dur = created                              
+      87 -                    .duration_since(std::time::UNIX_EPOCH)     
+      88 -                    .unwrap_or_default();                      
+      89 -                Utc.timestamp_opt(dur.as_secs() as i64, dur.sub
+         -sec_nanos())                                                   
+      90 -                    .single()                                  
+      91 -                    .unwrap_or(modify_date)                    
+      92 -            }                                                  
+      93 -            Err(_) => modify_date,                             
+      94 -        }                                                      
+      95 -    };                                                         
+      87 +    let create_date = meta.created().map_or(modify_date, |creat
+         +ed| {                                                          
+      88 +        let dur = created                                      
+      89 +            .duration_since(std::time::UNIX_EPOCH)             
+      90 +            .unwrap_or_default();                              
+      91 +        #[allow(clippy::cast_possible_wrap)]                   
+      92 +        Utc.timestamp_opt(dur.as_secs() as i64, dur.subsec_nano
+         +s())                                                           
+      93 +            .single()                                          
+      94 +            .unwrap_or(modify_date)                            
+      95 +    });                                                        
+      96  
+      97      let identity = FileIdentity {
+      98          inode: meta.ino(),
+
+● Write(crates/i1-audit/src/discovery/processes.rs)
+  ⎿  Added 11 lines
+       9  /// Discover all running processes from `/proc`.
+      10  ///
+      11  /// Uses the `procfs` crate for safe, structured access.
+      12 +///                                                            
+      13 +/// # Errors                                                   
+      14 +///                                                            
+      15 +/// Returns `AuditError::Procfs` if `/proc` cannot be read.    
+      16  pub fn discover_processes() -> Result<Vec<ProcessInfo>> {
+      17      let system_uptime = get_system_uptime()?;
+      18      let cpu_count = get_cpu_count();
+     ...
+      44  }
+      45  
+      46  /// Collect info for a single process.
+      47 +#[allow(clippy::cast_precision_loss)]                          
+      48  fn collect_process_info(
+      49      proc: &procfs::process::Process,
+      50      system_uptime: u64,
+     ...
+      102  }
+      103  
+      104  /// Get system uptime in seconds.
+      105 +///                                                           
+      106 +/// # Errors                                                  
+      107 +///                                                           
+      108 +/// Returns `AuditError::Procfs` if `/proc/uptime` cannot be r
+          +ead.                                                          
+      109 +#[allow(clippy::cast_possible_truncation, clippy::cast_sign_lo
+          +ss)]                                                          
+      110  pub fn get_system_uptime() -> Result<u64> {
+      111      let uptime =
+      112          procfs::Uptime::current().map_err(|e| AuditError::Proc
+           fs(e.to_string()))?;
+     ...
+      114  }
+      115  
+      116  /// Get number of CPU cores.
+      117 +#[must_use]                                                   
+      118  pub fn get_cpu_count() -> u32 {
+      119      procfs::CpuInfo::current()
+      120          .map(|c: procfs::CpuInfo| c.num_cores() as u32)
+
+● Write(crates/i1-audit/src/discovery/certs.rs)
+  ⎿  Added 5 lines
+      29  ];
+      30  
+      31  /// Discover all root certificates in system trust stores.
+      32 +///                                                            
+      33 +/// # Errors                                                   
+      34 +///                                                            
+      35 +/// Returns `AuditError` if certificate parsing fails for an en
+         +tire store.                                                    
+      36 +/// Individual cert parse failures are logged and skipped.     
+      37  pub async fn discover_root_certs() -> Result<Vec<RootCertInfo>>
+           {
+      38      let mut certs = Vec::new();
+      39      let mut seen_fingerprints = std::collections::HashSet::new(
+          );
+
+● Now fix encoding/txt_audit.rs (needs #[must_use]) and encoding/dns_names.rs:
+
+● Write(crates/i1-audit/src/encoding/dns_names.rs)
+  ⎿  Added 5 lines, removed 2 lines
+      17  
+      18  /// Build a DNS query name for a binary hash.
+      19  ///
+      20 -/// Example: `sha256 = "a3f2b8c91d4e..."` → `"a3f2b8c91d4e.bin.
+         -i1.is."`                                                       
+      20 +/// Example: `sha256 = "a3f2b8c91d4e..."` -> `"a3f2b8c91d4e.bin
+         +.i1.is."`                                                      
+      21 +#[must_use]                                                    
+      22  pub fn binary_dns_name(sha256: &str) -> String {
+      23      let prefix = &sha256[..HASH_PREFIX_LEN.min(sha256.len())];
+      24      format!("{prefix}.{BIN_ZONE}")
+     ...
+      26  
+      27  /// Build a DNS query name for a certificate fingerprint.
+      28  ///
+      28 -/// Example: `fingerprint = "d4e5f6a7b8c9..."` → `"d4e5f6a7b8c9
+         -.ca.i1.is."`                                                   
+      29 +/// Example: `fingerprint = "d4e5f6a7b8c9..."` -> `"d4e5f6a7b8c
+         +9.ca.i1.is."`                                                  
+      30 +#[must_use]                                                    
+      31  pub fn cert_dns_name(fingerprint: &str) -> String {
+      32      let prefix = &fingerprint[..HASH_PREFIX_LEN.min(fingerprint
+          .len())];
+      33      format!("{prefix}.{CA_ZONE}")
+      34  }
+      35  
+      36  /// Extract the hash prefix from a DNS name.
+      37 +#[must_use]                                                    
+      38  pub fn extract_prefix(dns_name: &str) -> Option<&str> {
+      39      dns_name.split('.').next()
+      40  }
+
+● Write(crates/i1-audit/src/encoding/txt_audit.rs)
+  ⎿  Added 7 lines, removed 1 line
+      1  //! Hybrid key=value + CBOR encoding for DNS TXT records.
+      2  //!
+      3  //! Small payloads use plain `k=v;k=v` pairs.
+      4 -//! When the payload exceeds the ~255-byte TXT record limit,    
+      4 +//! When the payload exceeds the 255-byte TXT record limit,     
+      5  //! overflow fields are CBOR-encoded and base64-appended.
+      6  
+      7  use base64::{engine::general_purpose::STANDARD as B64, Engine};
+     ...
+      18  /// Format: `"hash=<full>;name=<basename>;size=<bytes>;trust=<0
+          -100>;nodes=<count>"`
+      19  ///
+      20  /// If the data overflows 255 bytes, extra fields go into CBOR+
+          base64 overflow.
+      21 +///                                                            
+      22 +/// # Errors                                                   
+      23 +///                                                            
+      24 +/// Returns `AuditError::Encoding` if CBOR serialization fails.
+      25 +#[allow(clippy::cast_possible_truncation, clippy::cast_sign_los
+         +s)]                                                            
+      26  pub fn encode_binary_txt(binary: &BinaryInfo, node_count: u32) 
+          -> Result<String> {
+      27      let basename = binary
+      28          .path
+     ...
+      60  }
+      61  
+      62  /// Encode a root cert's audit data as a TXT record value.
+      63 +#[must_use]                                                    
+      64  pub fn encode_cert_txt(cert: &RootCertInfo, node_count: u32) ->
+           String {
+      65      // Extract a short issuer name (CN only)
+      66      let short_issuer = extract_cn(&cert.issuer).unwrap_or(&cert
+          .issuer);
+
+● Now fix consensus/query.rs and consensus/compare.rs:
+
+● Write(crates/i1-audit/src/consensus/query.rs)
+  ⎿  Added 14 lines, removed 2 lines
+      1  //! DNS consensus queries against bin.i1.is / ca.i1.is.
+      2  //!
+      3 -//! Phase 3 implementation — queries the network to see how many
+      3 +//! Phase 3 implementation -- queries the network to see how man
+        +y                                                               
+      4  //! other nodes report the same binary hash or cert fingerprint.
+      5  
+      6  use hickory_resolver::TokioResolver;
+     ...
+      23  }
+      24  
+      25  /// Query the network for a binary hash consensus.
+      26 +///                                                            
+      27 +/// # Errors                                                   
+      28 +///                                                            
+      29 +/// Returns `AuditError::DnsQuery` if the DNS query fails unexp
+         +ectedly.                                                       
+      30  pub async fn query_binary_consensus(
+      31      resolver: &TokioResolver,
+      32      sha256: &str,
+     ...
+      36  }
+      37  
+      38  /// Query the network for a certificate fingerprint consensus.
+      39 +///                                                            
+      40 +/// # Errors                                                   
+      41 +///                                                            
+      42 +/// Returns `AuditError::DnsQuery` if the DNS query fails unexp
+         +ectedly.                                                       
+      43  pub async fn query_cert_consensus(
+      44      resolver: &TokioResolver,
+      45      fingerprint: &str,
+     ...
+      81              })
+      82          }
+      83          Err(e) => {
+      76 -            // NXDOMAIN or SERVFAIL — hash not in network      
+      84 +            // NXDOMAIN or SERVFAIL -- hash not in network     
+      85              debug!(name = dns_name, error = %e, "no consensus r
+          ecord found");
+      86              Ok(ConsensusResult {
+      87                  hash: hash.to_string(),
+     ...
+      109  ///
+      110  /// Uses system resolver by default. In production, could be c
+           onfigured
+      111  /// to use specific nameservers for the i1.is zone.
+      112 +///                                                           
+      113 +/// # Errors                                                  
+      114 +///                                                           
+      115 +/// Returns `AuditError::DnsQuery` if the system resolver cann
+          +ot be created.                                                
+      116  pub fn create_resolver() -> Result<TokioResolver> {
+      117      let resolver = TokioResolver::builder_tokio()
+      118          .map_err(|e| AuditError::DnsQuery(format!("failed to c
+           reate resolver: {e}")))?
+
+● Write(crates/i1-audit/src/consensus/compare.rs)
+  ⎿  Added 11 lines, removed 1 line
+      1 -//! Local vs network comparison — flag anomalies.               
+      1 +//! Local vs network comparison -- flag anomalies.              
+      2  //!
+      3  //! After consensus queries, compare local state to what the net
+         work knows.
+      4  //! Unknown binaries or certs that aren't in consensus are flagg
+         ed.
+     ...
+       8  /// Anomaly detected during comparison.
+       9  #[derive(Debug, Clone)]
+      10  pub struct Anomaly {
+      11 +    /// What kind of anomaly                                   
+      12      pub kind: AnomalyKind,
+      13 +    /// How severe is it                                       
+      14      pub severity: Severity,
+      15 +    /// Human-readable description                             
+      16      pub description: String,
+      17  }
+      18  
+     ...
+      34  /// Severity levels.
+      35  #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+      36  pub enum Severity {
+      37 +    /// Informational                                          
+      38      Info,
+      39 +    /// Low severity                                           
+      40      Low,
+      41 +    /// Medium severity                                        
+      42      Medium,
+      43 +    /// High severity                                          
+      44      High,
+      45 +    /// Critical severity                                      
+      46      Critical,
+      47  }
+      48  
+     ...
+      50  ///
+      51  /// Returns anomalies for binaries that the network doesn't kno
+          w about
+      52  /// or that have suspiciously few reports.
+      53 +#[must_use]                                                    
+      54  pub fn compare_binaries(binaries: &[BinaryInfo], _min_node_thre
+          shold: u32) -> Vec<Anomaly> {
+      55      let mut anomalies = Vec::new();
+      56  
+     ...
+      103  }
+      104  
+      105  /// Compare local root certs against consensus data.
+      106 +#[must_use]                                                   
+      107  pub fn compare_certs(certs: &[RootCertInfo]) -> Vec<Anomaly> {
+      108      let mut anomalies = Vec::new();
+      109  
+
+● Fix scoring/binary_trust.rs and scoring/cert_trust.rs for the remaining clippy
+   issues:
+
+● Write(crates/i1-audit/src/scoring/binary_trust.rs)
+  ⎿  Added 6 lines, removed 4 lines
+       9  ///
+      10  /// Network consensus factor (`hash_consensus`) is left at 0.0 
+          until
+      11  /// Phase 3 (consensus queries) fills it in.
+      12 +#[must_use]                                                    
+      13  pub fn score_binary(binary: &BinaryInfo, weights: &TrustWeights
+          ) -> TrustScore {
+      14      let age_factor = compute_age_factor(binary);
+      15      let identity_stability = compute_identity_stability(binary)
+          ;
+     ...
+      31  
+      32  /// Age factor: sigmoid curve.
+      33  ///
+      33 -/// - 0 days → 0.0                                             
+      34 -/// - 30 days → ~0.5                                           
+      35 -/// - 365 days → ~0.97                                         
+      34 +/// - 0 days -> 0.0                                            
+      35 +/// - 30 days -> ~0.5                                          
+      36 +/// - 365 days -> ~0.97                                        
+      37  ///
+      38  /// Intuition: a binary that's been around a long time is less 
+          likely
+      39  /// to be recently planted malware.
+      40 +#[allow(clippy::cast_precision_loss)]                          
+      41  fn compute_age_factor(binary: &BinaryInfo) -> f64 {
+      42      let age_days = (Utc::now() - binary.create_date).num_days()
+          .max(0) as f64;
+      43      // Sigmoid: 1 / (1 + e^(-k*(x - midpoint)))
+     ...
+      70          // System binaries are expected; running or not is fine
+      71          if binary.running { 1.0 } else { 0.8 }
+      72      } else if binary.running {
+      71 -        // Running but not in system path — worth investigating
+      73 +        // Running but not in system path -- worth investigatin
+         +g                                                              
+      74          0.4
+      75      } else {
+      76          0.5
+
+● Also need to fix snapshot.rs for the must_use issue:
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(crates/i1-audit/src/types/snapshot.rs)
+  ⎿  Added 9 lines, removed 1 line
+      1 -//! Audit snapshot — point-in-time system state.                
+      1 +//! Audit snapshot -- point-in-time system state.               
+      2  
+      3  use chrono::{DateTime, Utc};
+      4  use serde::{Deserialize, Serialize};
+     ...
+      31  /// Summary statistics for a snapshot.
+      32  #[derive(Debug, Clone, Serialize, Deserialize)]
+      33  pub struct AuditSummary {
+      34 +    /// Total binaries discovered                              
+      35      pub total_binaries: usize,
+      36 +    /// Total running processes                                
+      37      pub total_processes: usize,
+      38 +    /// Total root certificates found                          
+      39      pub total_root_certs: usize,
+      40 +    /// Binaries matched to running processes                  
+      41      pub running_binaries: usize,
+      42 +    /// Expired root certificates                              
+      43      pub expired_certs: usize,
+      44 +    /// Binaries with trust score below threshold              
+      45      pub low_trust_binaries: usize,
+      46 +    /// Certs not found in consensus                           
+      47      pub unknown_certs: usize,
+      48  }
+      49  
+      50  impl AuditSummary {
+      51      /// Build summary from snapshot data.
+      52 +    #[must_use]                                                
+      53      pub fn from_snapshot(
+      54          binaries: &[BinaryInfo],
+      55          processes: &[ProcessInfo],
+
+● Now also fix the error.rs to add #[must_use] where needed:
+
+● Read 1 file (ctrl+o to expand)
+
+● That looks fine. Let me now run clippy again:
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep -E "^error|^warning"
+      | head -30)
+  ⎿  error: package `i1-core` is missing `package.readme` metadata
+     error: package `i1-client` is missing `package.readme` metadata
+     error: package `i1-providers` is missing `package.readme` metadata
+     … +28 lines (ctrl+o to expand)
+
+● These are all pre-existing workspace-wide issues (missing readme metadata,
+  multiple dependency versions). Let me check if there are any i1-audit-specific
+   errors:
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep "crates/i1-audit")
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+       --> crates/i1-audit/src/consensus/query.rs:63:13
+     … +5 lines (ctrl+o to expand)
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep -B2
+      "crates/i1-audit")
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+     --
+     … +25 lines (ctrl+o to expand)
+
+● Let me fix these remaining issues:
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep "crates/i1-audit" -A
+      10 | head -80)
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+     error: package `i1-core` is missing `package.readme` metadata
+     … +50 lines (ctrl+o to expand)
+
+● Now I know all the issues. Let me fix them:
+
+● Update(crates/i1-audit/src/consensus/query.rs)
+  ⎿  Added 11 lines, removed 10 lines
+      60  
+      61      match lookup {
+      62          Ok(records) => {
+      63 -            for record in records.iter() {                     
+      63 +            if let Some(record) = records.iter().next() {      
+      64                  let txt = record.to_string();
+      65                  let node_count = parse_field(&txt, "nodes").unw
+          rap_or(0);
+      66                  let network_trust = parse_field(&txt, "trust");
+      67  
+      68 -                return Ok(ConsensusResult {                    
+      68 +                Ok(ConsensusResult {                           
+      69                      hash: hash.to_string(),
+      70                      found: true,
+      71                      node_count,
+      72                      network_trust,
+      73 -                });                                            
+      73 +                })                                             
+      74 +            } else {                                           
+      75 +                // Records exist but no matching data          
+      76 +                Ok(ConsensusResult {                           
+      77 +                    hash: hash.to_string(),                    
+      78 +                    found: false,                              
+      79 +                    node_count: 0,                             
+      80 +                    network_trust: None,                       
+      81 +                })                                             
+      82              }
+      75 -            // Records exist but no matching data              
+      76 -            Ok(ConsensusResult {                               
+      77 -                hash: hash.to_string(),                        
+      78 -                found: false,                                  
+      79 -                node_count: 0,                                 
+      80 -                network_trust: None,                           
+      81 -            })                                                 
+      83          }
+      84          Err(e) => {
+      85              // NXDOMAIN or SERVFAIL -- hash not in network
+
+● Update(crates/i1-audit/src/discovery/binaries.rs)
+  ⎿  Added 1 line, removed 1 line
+      43              .max_depth(1)
+      44              .follow_links(false)
+      45              .into_iter()
+      46 -            .filter_map(|e| e.ok())                            
+      46 +            .filter_map(std::result::Result::ok)               
+      47              .filter(|e| e.file_type().is_file())
+      48              .collect();
+      49  
+
+● Update(crates/i1-audit/src/discovery/processes.rs)
+  ⎿  Added 1 line, removed 1 line
+      68  
+      69      // Compute usage metric
+      70      let ticks_per_sec = procfs::ticks_per_second();
+      71 -    let start_time_secs = boot_time_secs + (stat.starttime / ti
+         -cks_per_sec as u64);                                           
+      71 +    let start_time_secs = boot_time_secs + (stat.starttime / ti
+         +cks_per_sec);                                                  
+      72      let now_secs = std::time::SystemTime::now()
+      73          .duration_since(std::time::UNIX_EPOCH)
+      74          .unwrap_or_default()
+
+● Update(crates/i1-audit/src/discovery/processes.rs)
+  ⎿  Added 1 line
+      115  
+      116  /// Get number of CPU cores.
+      117  #[must_use]
+      118 +#[allow(clippy::cast_possible_truncation)]                    
+      119  pub fn get_cpu_count() -> u32 {
+      120      procfs::CpuInfo::current()
+      121          .map(|c: procfs::CpuInfo| c.num_cores() as u32)
+
+● Update(crates/i1-audit/src/scoring/binary_trust.rs)
+  ⎿  Added 1 line, removed 1 line
+      52  /// For now this is always 1.0 (we'd need historical snapshots 
+          to detect
+      53  /// inode changes). A replaced binary would get a new inode on 
+          most
+      54  /// filesystems, which future diff logic will catch.
+      55 -fn compute_identity_stability(_binary: &BinaryInfo) -> f64 {   
+      55 +const fn compute_identity_stability(_binary: &BinaryInfo) -> f6
+         +4 {                                                            
+      56      // TODO: compare with previous snapshot to detect inode cha
+          nges
+      57      1.0
+      58  }
+
+● Now fix the cert_trust.rs KNOWN_CAS placement issue (items after statements):
+
+● Read 1 file (ctrl+o to expand)
+
+● The issue is the const item (KNOWN_CAS) appears after the let issuer_lower
+  statement. Move the const before the let:
+
+● Update(crates/i1-audit/src/scoring/cert_trust.rs)
+  ⎿  Removed 1 line
+      35  /// This is a best-effort heuristic; the real validation comes
+      36  /// from network consensus.
+      37  fn is_known_issuer(issuer: &str) -> bool {
+      38 -    let issuer_lower = issuer.to_lowercase();                  
+      38      const KNOWN_CAS: &[&str] = &[
+      39          "digicert",
+      40          "let's encrypt",
+
+● Update(crates/i1-audit/src/scoring/cert_trust.rs)
+  ⎿  Added 1 line
+      65          "ssl.com",
+      66          "trustwave",
+      67      ];
+      68 +    let issuer_lower = issuer.to_lowercase();                  
+      69      KNOWN_CAS.iter().any(|ca| issuer_lower.contains(ca))
+      70  }
+      71  
+
+● Now also fix the em-dash in doc comment:
+
+● Update(crates/i1-audit/src/scoring/cert_trust.rs)
+  ⎿  Added 1 line, removed 1 line
+       4  
+       5  /// Score a root certificate's trustworthiness.
+       6  ///
+       7 -/// Local factors only — network consensus filled in later.    
+       7 +/// Local factors only -- network consensus filled in later.   
+       8  pub fn score_cert(cert: &RootCertInfo) -> CertTrust {
+       9      let validity_ok = !cert.expired;
+      10  
+
+● Now run clippy again:
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep "crates/i1-audit"
+      -B2)
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+     --
+     … +3 lines (ctrl+o to expand)
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep "crates/i1-audit" -A
+      10)
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+     error: package `i1-core` is missing `package.readme` metadata
+     … +18 lines (ctrl+o to expand)
+
+● One more — convert if let to map_or_else. Let me fix it:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates/i1-audit/src/consensus/query.rs)
+  ⎿  Added 12 lines, removed 15 lines
+      59      let lookup = resolver.txt_lookup(dns_name).await;
+      60  
+      61      match lookup {
+      62 -        Ok(records) => {                                       
+      63 -            if let Some(record) = records.iter().next() {      
+      62 +        Ok(records) => Ok(records.iter().next().map_or_else(   
+      63 +            || ConsensusResult {                               
+      64 +                hash: hash.to_string(),                        
+      65 +                found: false,                                  
+      66 +                node_count: 0,                                 
+      67 +                network_trust: None,                           
+      68 +            },                                                 
+      69 +            |record| {                                         
+      70                  let txt = record.to_string();
+      71                  let node_count = parse_field(&txt, "nodes").unw
+          rap_or(0);
+      72                  let network_trust = parse_field(&txt, "trust");
+      67 -                                                               
+      68 -                Ok(ConsensusResult {                           
+      73 +                ConsensusResult {                              
+      74                      hash: hash.to_string(),
+      75                      found: true,
+      76                      node_count,
+      77                      network_trust,
+      73 -                })                                             
+      74 -            } else {                                           
+      75 -                // Records exist but no matching data          
+      76 -                Ok(ConsensusResult {                           
+      77 -                    hash: hash.to_string(),                    
+      78 -                    found: false,                              
+      79 -                    node_count: 0,                             
+      80 -                    network_trust: None,                       
+      81 -                })                                             
+      82 -            }                                                  
+      83 -        }                                                      
+      78 +                }                                              
+      79 +            },                                                 
+      80 +        )),                                                    
+      81          Err(e) => {
+      82              // NXDOMAIN or SERVFAIL -- hash not in network
+      83              debug!(name = dns_name, error = %e, "no consensus r
+          ecord found");
+
+● Bash(cargo clippy -p i1-audit -- -D warnings 2>&1 | grep "crates/i1-audit")
+  ⎿      Checking i1-audit v0.1.0 (/home/hue/Development/i1/crates/i1-audit
+     )
+
+● No more i1-audit-specific issues. The only remaining errors are workspace-wide
+   pre-existing ones (missing readme metadata, multiple dep versions). Now let
+  me also build the CLI to make sure the integration works:
+
+● Bash(cargo build -p i1-cli 2>&1 | tail -20)
+  ⎿     Compiling i1-providers v0.1.0 (/home/hue/Development/i1/crates/i1-p
+     roviders)
+        Compiling procfs v0.17.0
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 3m)
+
+● Clean build. Now run the tests:
+
+● Bash(cargo test -p i1-audit 2>&1)
+  ⎿     Compiling tokio v1.49.0
+        Compiling hickory-proto v0.25.2
+        Compiling tokio-stream v0.1.18
+     … +19 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● All 15 tests pass. Let me verify the CLI works:
+
+● Bash(cargo run -p i1-cli -- audit --help 2>&1)
+  ⎿      Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12
+     s
+          Running `target/debug/i1 audit --help`
+     … +24 lines (ctrl+o to expand)
+
+● Now let me check on the background agent for the sibling projects:
+
+● Task Output(non-blocking) a9e6c71
+  ⎿  Read output (ctrl+o to expand)
+
+● All tasks complete. Let me summarize the results and address the user's
+  follow-up message.
+
+  ---
+  i1-audit crate is built and passing! Here's the summary:
+
+  What was implemented
+
+  New crate: crates/i1-audit/ with 16 source files:
+
+  Module: types/
+  Files: binary.rs, process.rs, cert.rs, trust.rs, snapshot.rs
+  Purpose: Core data types
+  ────────────────────────────────────────
+  Module: hash.rs
+  Files:
+  Purpose: Streaming SHA-256 via ring::digest
+  ────────────────────────────────────────
+  Module: discovery/
+  Files: binaries.rs, processes.rs, certs.rs
+  Purpose: Walk /usr/bin, read /proc, parse CA stores
+  ────────────────────────────────────────
+  Module: scoring/
+  Files: binary_trust.rs, cert_trust.rs, weights.rs
+  Purpose: Multi-factor trust scoring
+  ────────────────────────────────────────
+  Module: encoding/
+  Files: dns_names.rs, txt_audit.rs
+  Purpose: DNS record encoding (hash-prefix labels + hybrid k=v/CBOR)
+  ────────────────────────────────────────
+  Module: consensus/
+  Files: query.rs, compare.rs
+  Purpose: DNS consensus queries + anomaly detection
+
+  CLI integration: i1 audit binaries|processes|certs|full [--json] [--below 0.5]
+   [--publish]
+
+  Verification
+
+  - cargo build --workspace -- clean
+  - cargo test -p i1-audit -- 15/15 pass
+  - cargo clippy -p i1-audit -- 0 crate-specific errors (only pre-existing
+  workspace-wide metadata warnings)
+
+  ---
+  Re: your TTL checker / QR code idea
+
+  That's a killer feature. I checked ../i1-dns and ../i1-is -- both are alive
+  and well:
+
+  - i1-dns -- Hickory-based authoritative DNS with ACME API, catch-all wildcard,
+   zone auto-discovery
+  - i1-is -- Full web server with script delivery, domain parking, TLS, security
+   intelligence (231K main.rs!)
+  - i1-srv -- DNS threat intelligence server with bl.i1.is, rep.i1.is, sig.i1.is
+   zones
+
+  The TTL checker idea fits perfectly into the audit system. Here's how I see it
+   working:
+
+  1. i1-audit generates a "trust digest" -- a compact hash of your system state
+  (binary hashes + cert fingerprints) that gets published as a special TXT
+  record at something like <node-hash>.sig.i1.is with a known TTL
+  2. QR code contains: the DNS name to check + the expected TXT value + the
+  expected TTL
+  3. Phone scans QR -> resolves the DNS name over cell network (completely
+  independent path!) -> compares what the TXT record says vs what it should say,
+   and checks if the TTL has drifted (indicating someone might be serving
+  stale/poisoned records)
+
+  The TTL drift is the clever part -- if someone is MITM'ing your DNS, the TTL
+  will be different than expected because they're caching/replaying. It's a
+  side-channel integrity check using the phone's cell network as an independent
+  trust anchor.
+
+  Want me to implement that as part of Phase 2, or should we knock out the
+  encoding + i1-srv zone extensions first?
+
+✻ Cogitated for 19m 26s
+
+● Agent "Explore i1-dns and i1-is" completed
+
+● The background exploration agent finished - confirmed what I already
+  summarized. The i1-audit implementation is complete and all three sibling
+  projects (i1-dns, i1-is, i1-srv) are checked. Just waiting on your call for
+  next steps on the TTL checker / QR code feature.
+
+❯ /export 
+  ⎿  Failed to export conversation: ENOENT: no such file or directory, open '/ho
+     me/hue/Development/i1/~/2026-02-18-011808-implement-the-following-plan.txt'
+
+❯ /export 
+  ⎿  Conversation copied to clipboard

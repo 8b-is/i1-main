@@ -1,0 +1,61 @@
+[package]
+name = "i1-srv"
+description = "Distributed DNS threat intelligence server for i1.is"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# DNS server framework (same version as workspace hickory-resolver)
+hickory-server = "0.25"
+hickory-proto = "0.25"
+hickory-resolver = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CBOR encoding for overflow TXT records
+ciborium = "0.2"
+
+# Base64 for CBOR-in-TXT encoding
+base64 = "0.22"
+
+# SHA-256 for TLSA hashes
+ring = "0.17"
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Config file parsing
+toml = "0.8"
+
+# Platform directories (for finding state file path)
+dirs = "6.0"
+
+# Async traits
+async-trait = { workspace = true }
+
+# Internal crates
+i1-core = { workspace = true }
+i1-providers = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = "3.10"
+
+[lints]
+workspace = true

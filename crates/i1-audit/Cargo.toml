@@ -1,0 +1,62 @@
+[package]
+name = "i1-audit"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-trust binary & certificate audit system for i1.is"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/i1-is/i1"
+keywords = ["security", "audit", "trust", "binary-analysis", "certificates"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+# Crypto
+ring = "0.17"
+hex = "0.4"
+
+# Filesystem traversal
+walkdir = "2.5"
+
+# Process info (/proc)
+procfs = "0.17"
+
+# Certificate parsing
+x509-parser = "0.16"
+pem = "3.0"
+
+# DNS consensus queries
+hickory-resolver = { workspace = true }
+
+# Encoding
+ciborium = "0.2"
+base64 = "0.22"
+
+# Async
+tokio = { workspace = true, features = ["fs"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# System info
+hostname = "0.4"
+
+# QR code generation for TTL verification
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true
