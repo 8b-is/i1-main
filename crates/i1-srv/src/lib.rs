@@ -11,6 +11,8 @@
 //! - `geo.i1.is` - Country-level blocks
 //! - `asn.i1.is` - ASN-level blocks
 //! - `sig.i1.is` - Signal records (near-zero TTL version checks)
+//! - `bin.i1.is` - Binary hash consensus (hash-prefix -> TXT audit data)
+//! - `ca.i1.is` - Certificate fingerprint consensus (fp-prefix -> TXT cert data)
 //!
 //! # Encoding
 //!

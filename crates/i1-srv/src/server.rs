@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::authority::zone_builder::{self, BuiltZones, DefenseSnapshot};
 use crate::config::ServerConfig;
+use crate::sync::collector;
 
 /// TCP connection timeout for DNS queries.
 const TCP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,6 +24,8 @@ fn build_catalog(zones: BuiltZones) -> Catalog {
     let geo_origin = Authority::origin(&zones.geo).clone();
     let asn_origin = Authority::origin(&zones.asn).clone();
     let sig_origin = Authority::origin(&zones.signal).clone();
+    let bin_origin = Authority::origin(&zones.binary).clone();
+    let ca_origin = Authority::origin(&zones.cert).clone();
 
     catalog.upsert(
         bl_origin,
@@ -44,6 +47,14 @@ fn build_catalog(zones: BuiltZones) -> Catalog {
         sig_origin,
         vec![Arc::new(zones.signal) as Arc<dyn AuthorityObject>],
     );
+    catalog.upsert(
+        bin_origin,
+        vec![Arc::new(zones.binary) as Arc<dyn AuthorityObject>],
+    );
+    catalog.upsert(
+        ca_origin,
+        vec![Arc::new(zones.cert) as Arc<dyn AuthorityObject>],
+    );
 
     catalog
 }
@@ -52,7 +63,33 @@ fn build_catalog(zones: BuiltZones) -> Catalog {
 ///
 /// This function binds UDP and TCP sockets, builds the DNS zones from
 /// the defense snapshot, and runs until shutdown.
-pub async fn run(config: &ServerConfig, snapshot: DefenseSnapshot) -> crate::Result<()> {
+pub async fn run(config: &ServerConfig, mut snapshot: DefenseSnapshot) -> crate::Result<()> {
+    // Load audit snapshot if available.
+    let audit_path = config
+        .audit_path
+        .clone()
+        .or_else(collector::default_audit_path);
+
+    if let Some(ref path) = audit_path {
+        match collector::load_audit_snapshot(path) {
+            Ok(Some(audit)) => {
+                info!(
+                    bins = audit.binaries.len(),
+                    certs = audit.root_certs.len(),
+                    node = %audit.node_id,
+                    "loaded audit snapshot"
+                );
+                snapshot.audit = Some(audit);
+            }
+            Ok(None) => {
+                info!("no audit snapshot found, bin/ca zones will be empty");
+            }
+            Err(e) => {
+                info!(error = %e, "failed to load audit snapshot, continuing without");
+            }
+        }
+    }
+
     // Build zones from defense state.
     let serial = chrono::Utc::now().format("%Y%m%d01").to_string();
     let serial: u32 = serial

@@ -51,6 +51,7 @@ async-trait = { workspace = true }
 
 # Internal crates
 i1-core = { workspace = true }
+i1-audit = { workspace = true }
 i1-providers = { workspace = true }
 
 [dev-dependencies]

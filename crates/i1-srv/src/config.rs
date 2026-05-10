@@ -19,6 +19,9 @@ pub struct ServerConfig {
     /// Path to defense state file (default: auto-detect from i1-cli).
     pub state_path: Option<PathBuf>,
 
+    /// Path to audit snapshot file (default: auto-detect).
+    pub audit_path: Option<PathBuf>,
+
     /// How often to reload defense state (seconds).
     #[serde(default = "default_reload_interval")]
     pub reload_interval_secs: u64,
@@ -50,6 +53,14 @@ pub struct ZoneConfig {
     /// Signal zone origin (default: sig.i1.is).
     #[serde(default = "default_sig_zone")]
     pub signal: String,
+
+    /// Binary consensus zone origin (default: bin.i1.is).
+    #[serde(default = "default_bin_zone")]
+    pub binary: String,
+
+    /// Certificate consensus zone origin (default: ca.i1.is).
+    #[serde(default = "default_ca_zone")]
+    pub cert: String,
 }
 
 impl Default for ServerConfig {
@@ -59,6 +70,7 @@ impl Default for ServerConfig {
             zones: ZoneConfig::default(),
             node_name: String::from("node1"),
             state_path: None,
+            audit_path: None,
             reload_interval_secs: default_reload_interval(),
             peers: Vec::new(),
         }
@@ -73,6 +85,8 @@ impl Default for ZoneConfig {
             geo: default_geo_zone(),
             asn: default_asn_zone(),
             signal: default_sig_zone(),
+            binary: default_bin_zone(),
+            cert: default_ca_zone(),
         }
     }
 }
@@ -114,6 +128,14 @@ fn default_sig_zone() -> String {
     String::from("sig.i1.is.")
 }
 
+fn default_bin_zone() -> String {
+    String::from("bin.i1.is.")
+}
+
+fn default_ca_zone() -> String {
+    String::from("ca.i1.is.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,8 +146,11 @@ mod tests {
         assert_eq!(config.listen.port(), 5353);
         assert_eq!(config.zones.blocklist, "bl.i1.is.");
         assert_eq!(config.zones.reputation, "rep.i1.is.");
+        assert_eq!(config.zones.binary, "bin.i1.is.");
+        assert_eq!(config.zones.cert, "ca.i1.is.");
         assert_eq!(config.reload_interval_secs, 60);
         assert!(config.peers.is_empty());
+        assert!(config.audit_path.is_none());
     }
 
     #[test]

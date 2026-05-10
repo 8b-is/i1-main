@@ -12,13 +12,13 @@ use super::Context;
 pub async fn execute(ctx: Context, args: AuditArgs) -> Result<()> {
     match args.command {
         AuditCommands::Binaries {
-            publish: _,
+            publish,
             below,
             paths,
-        } => audit_binaries(&ctx, below, paths.as_deref()).await,
+        } => audit_binaries(&ctx, publish, below, paths.as_deref()).await,
         AuditCommands::Processes => audit_processes(&ctx).await,
         AuditCommands::Certs { validate: _ } => audit_certs(&ctx).await,
-        AuditCommands::Full { publish: _ } => audit_full(&ctx).await,
+        AuditCommands::Full { publish } => audit_full(&ctx, publish).await,
         AuditCommands::Verify { output, url_only } => {
             audit_verify(&ctx, &output, url_only).await
         }
@@ -28,6 +28,7 @@ pub async fn execute(ctx: Context, args: AuditArgs) -> Result<()> {
 /// Audit system binaries: discover, hash, score.
 async fn audit_binaries(
     ctx: &Context,
+    publish: bool,
     below: Option<f64>,
     extra_paths: Option<&[String]>,
 ) -> Result<()> {
@@ -115,6 +116,10 @@ async fn audit_binaries(
             format_size(bin.size).dimmed(),
             running_indicator
         );
+    }
+
+    if publish {
+        publish_snapshot_from_binaries(&binaries)?;
     }
 
     println!();
@@ -258,14 +263,19 @@ async fn audit_certs(ctx: &Context) -> Result<()> {
 }
 
 /// Full audit: binaries + processes + certs.
-async fn audit_full(ctx: &Context) -> Result<()> {
+async fn audit_full(ctx: &Context, publish: bool) -> Result<()> {
     use i1_audit::discovery::DEFAULT_BIN_PATHS;
     use i1_audit::scoring::offline_weights;
 
+    let paths: Vec<&str> = DEFAULT_BIN_PATHS.to_vec();
+    let weights = offline_weights();
+    let snapshot = i1_audit::collect_snapshot(&paths, &weights).await?;
+
+    if publish {
+        publish_audit_snapshot(&snapshot)?;
+    }
+
     if matches!(ctx.output_format, OutputFormat::Json) {
-        let paths: Vec<&str> = DEFAULT_BIN_PATHS.to_vec();
-        let weights = offline_weights();
-        let snapshot = i1_audit::collect_snapshot(&paths, &weights).await?;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
@@ -276,7 +286,7 @@ async fn audit_full(ctx: &Context) -> Result<()> {
     );
     println!();
 
-    audit_binaries(ctx, None, None).await?;
+    audit_binaries(ctx, false, None, None).await?;
     audit_processes(ctx).await?;
     audit_certs(ctx).await?;
 
@@ -378,6 +388,64 @@ async fn audit_verify(ctx: &Context, output_path: &str, url_only: bool) -> Resul
     println!();
 
     Ok(())
+}
+
+/// Get the audit snapshot directory path.
+fn audit_data_dir() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .map(|d| d.data_dir().join("i1"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Write a full audit snapshot to the shared data directory for i1-srv to read.
+fn publish_audit_snapshot(snapshot: &i1_audit::AuditSnapshot) -> Result<()> {
+    let audit_dir = audit_data_dir();
+    std::fs::create_dir_all(&audit_dir)?;
+    let path = audit_dir.join("audit_snapshot.json");
+    std::fs::write(&path, serde_json::to_string_pretty(snapshot)?)?;
+    println!(
+        "  {} {}",
+        "Published to".bright_green(),
+        path.display().to_string().bright_white()
+    );
+    Ok(())
+}
+
+/// Write a partial snapshot (binaries only) for i1-srv.
+fn publish_snapshot_from_binaries(binaries: &[i1_audit::BinaryInfo]) -> Result<()> {
+    use chrono::Utc;
+    use i1_audit::types::AuditSummary;
+
+    let running = binaries.iter().filter(|b| b.running).count();
+    let low_trust = binaries
+        .iter()
+        .filter(|b| b.trust_score.as_ref().is_some_and(|s| s.total < 0.3))
+        .count();
+
+    let node_id = std::fs::read_to_string("/etc/machine-id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    let snapshot = i1_audit::AuditSnapshot {
+        node_id,
+        collected_at: Utc::now(),
+        system_uptime_secs: 0,
+        cpu_count: 0,
+        binaries: binaries.to_vec(),
+        processes: vec![],
+        root_certs: vec![],
+        summary: AuditSummary {
+            total_binaries: binaries.len(),
+            total_processes: 0,
+            total_root_certs: 0,
+            running_binaries: running,
+            expired_certs: 0,
+            low_trust_binaries: low_trust,
+            unknown_certs: 0,
+        },
+    };
+
+    publish_audit_snapshot(&snapshot)
 }
 
 /// Format file size for display.

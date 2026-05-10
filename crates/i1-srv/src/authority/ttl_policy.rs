@@ -44,6 +44,14 @@ pub const SIGNAL_TTL: u32 = 30;
 /// Country and ASN blocks are stable data.
 pub const GEO_ASN_TTL: u32 = 86400;
 
+/// TTL for binary consensus TXT records.
+/// Refreshes hourly as new nodes publish.
+pub const BINARY_CONSENSUS_TTL: u32 = 3600;
+
+/// TTL for certificate consensus TXT records.
+/// Certs change rarely; 24-hour cache is fine.
+pub const CERT_CONSENSUS_TTL: u32 = 86400;
+
 /// SOA minimum TTL (negative caching).
 /// Quick false-positive recovery: if an IP is clean (NXDOMAIN),
 /// resolvers only cache that for 5 minutes.
